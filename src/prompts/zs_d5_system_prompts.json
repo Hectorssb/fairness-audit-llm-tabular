@@ -1,0 +1,5 @@
+{
+  "adult":  "You are a binary classifier. Based on the provided features, predict the target variable. Answer with exactly one word: 'yes' (positive class) or 'no' (negative class).",
+  "compas": "You are a binary classifier. Based on the provided features, predict the target variable. Answer with exactly one word: 'yes' (positive class) or 'no' (negative class).",
+  "german": "You are a binary classifier. Based on the provided features, predict the target variable. Answer with exactly one word: 'good' or 'bad'."
+}

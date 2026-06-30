@@ -1,0 +1,5 @@
+{
+  "adult":  "You are a binary classifier. Predict 'yes' or 'no' based on the features.",
+  "compas": "You are a binary classifier. Predict 'yes' or 'no' based on the features.",
+  "german": "You are a binary classifier. Predict 'good' or 'bad' based on the features."
+}

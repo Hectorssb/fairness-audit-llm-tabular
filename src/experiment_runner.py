@@ -1,0 +1,458 @@
+"""Experiment orchestrator: runs all conditions for one loaded HuggingFace model.
+
+Conditions:
+  - ICL data-level : D1_original, D2_fair_causal, D3_resampled (test=D1).
+  - D4a            : zero-shot CoT (test=D1 and test=D2).
+  - D4b_D1, D4b_D2 : few-shot CoT, 10 demos with template reasoning (test=D1 and test=D2).
+  - D4r_0, D4r_D1, D4r_D2 : native reasoning, 0 or 10 demos input+label only
+                            (HF_D4R_MODELS only; test=D1 and test=D2).
+  - ZS_D1, ZS_D5   : zero-shot baselines (test=D1).
+  - D5_decontam    : few-shot with anonymised column names (test=D1).
+
+D4* outputs use a `_testD1`/`_testD2` filename suffix and a `test_set` column.
+"""
+
+import gc
+import os
+from pathlib import Path
+
+import torch
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+from data_loader import DATASET_CONFIG
+from hf_classifier import (
+    run_fewshot_experiment,
+    predict_fewshot,
+    select_fewshot_examples,
+    DATASET_PROMPTS,
+)
+from hf_cot_classifier import run_zs_cot_experiment, run_fs_cot_experiment
+from hf_classifier import _generate
+from hf_zeroshot_classifier import run_zs_d1, run_zs_d5, build_column_mapping
+from metrics import evaluate_all_sensitive, save_results
+from prompts import D5_SYSTEM as _D5_SYSTEM
+
+SEED = 42
+
+# HuggingFace models that support native reasoning for D4r.
+# Gemma-4 uses enable_thinking=True via the chat template; gpt-oss-20b uses
+# "Reasoning: high" in the system prompt (Harmony format).
+HF_D4R_MODELS = {"google/gemma-4-E4B-it", "google/gemma-4-31B-it", "openai/gpt-oss-20b"}
+
+
+# ---------------------------------------------------------------------------
+# AUX METHODS
+# ---------------------------------------------------------------------------
+
+def _get_train_test(dataset_name: str, condition: str, data_dir: Path, test_size: int, seed: int) -> tuple:
+    """Return (df_train, df_test) with test always fixed on D1_original."""
+    cfg    = DATASET_CONFIG[dataset_name]
+    target = cfg["target"]
+
+    df_d1 = pd.read_csv(data_dir / dataset_name / "D1_original.csv")
+    _, df_test = train_test_split(
+        df_d1, test_size=test_size, random_state=seed, stratify=df_d1[target]
+    )
+
+    df_cond = pd.read_csv(data_dir / dataset_name / f"{condition}.csv")
+    df_train, _ = train_test_split(
+        df_cond, test_size=test_size, random_state=seed, stratify=df_cond[target]
+    )
+    return df_train, df_test.reset_index(drop=True)
+
+
+def _get_d4_test_sets(dataset_name: str, data_dir: Path, test_size: int, seed: int) -> dict:
+    """Return {'D1': df_test_d1, 'D2': df_test_d2} for D4* dual-test evaluation.
+
+    Both splits use the same stratified-split rule (test_size, seed); they
+    differ only in the source distribution (D1_original vs D2_fair_causal).
+    """
+    cfg    = DATASET_CONFIG[dataset_name]
+    target = cfg["target"]
+
+    df_d1 = pd.read_csv(data_dir / dataset_name / "D1_original.csv")
+    _, df_test_d1 = train_test_split(
+        df_d1, test_size=test_size, random_state=seed, stratify=df_d1[target]
+    )
+
+    df_d2 = pd.read_csv(data_dir / dataset_name / "D2_fair_causal.csv")
+    _, df_test_d2 = train_test_split(
+        df_d2, test_size=test_size, random_state=seed, stratify=df_d2[target]
+    )
+
+    return {
+        "D1": df_test_d1.reset_index(drop=True),
+        "D2": df_test_d2.reset_index(drop=True),
+    }
+
+
+def _skip(path: Path, label: str) -> bool:
+    """Skip a (cond, model, dataset) entry if its output CSV already exists."""
+    if path.exists():
+        print(f"  [SKIP] {label} already exists.")
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# EXPERIMENT BLOCKS
+# ---------------------------------------------------------------------------
+
+def _run_icl(dataset_name, model, tokenizer, model_id, model_tag, results_out, data_dir, n_examples, test_size, seed):
+    for condition in ["D1_original", "D2_fair_causal", "D3_resampled"]:
+        prefix = f"{dataset_name}_{condition}_LLM_FewShot_{model_tag}"
+        if _skip(results_out / f"{prefix}_table_performance.csv", f"ICL {condition}"):
+            continue
+        print(f"  [ICL Fewshot] {condition}")
+        df_train, df_test = _get_train_test(dataset_name, condition, data_dir, test_size, seed)
+        run_fewshot_experiment(
+            df_train=df_train, df_test=df_test,
+            dataset_name=dataset_name, data_condition=condition,
+            model=model, tokenizer=tokenizer, model_id=model_id,
+            n_examples=n_examples, output_dir=results_out,
+        )
+
+
+def _run_cot(dataset_name, model, tokenizer, model_id, model_tag, results_out, data_dir, test_size, seed):
+    """D4a (zero-shot CoT), D4b_D1 and D4b_D2 (few-shot CoT) on test=D1 and test=D2."""
+    cfg = DATASET_CONFIG[dataset_name]
+    target_col = cfg["target"]
+    df_d1 = pd.read_csv(data_dir / dataset_name / "D1_original.csv")
+    df_d1_train, _ = train_test_split(
+        df_d1, test_size=test_size, random_state=seed, stratify=df_d1[target_col]
+    )
+    df_d2 = pd.read_csv(data_dir / dataset_name / "D2_fair_causal.csv")
+    df_d2_train, _ = train_test_split(
+        df_d2, test_size=test_size, random_state=seed, stratify=df_d2[target_col]
+    )
+    test_sets = _get_d4_test_sets(dataset_name, data_dir, test_size, seed)
+
+    for test_tag, df_test in test_sets.items():
+        d4a_prefix = f"{dataset_name}_D4a_LLM_ZSCoT_D4a_{model_tag}_test{test_tag}"
+        if not _skip(results_out / f"{d4a_prefix}_table_performance.csv", f"D4a test={test_tag}"):
+            print(f"  [D4a ZS-CoT] D4a (test={test_tag})")
+            run_zs_cot_experiment(
+                df_test=df_test, dataset_name=dataset_name, data_condition="D4a",
+                model=model, tokenizer=tokenizer, model_id=model_id,
+                output_dir=results_out, test_set=test_tag,
+            )
+
+        d4b_d1_prefix = f"{dataset_name}_D4b_D1_LLM_FSCoT_D4b_{model_tag}_test{test_tag}"
+        if not _skip(results_out / f"{d4b_d1_prefix}_table_performance.csv", f"D4b_D1 test={test_tag}"):
+            print(f"  [D4b FS-CoT] D4b_D1 (demos from D1, test={test_tag})")
+            run_fs_cot_experiment(
+                df_train=df_d1_train, df_test=df_test,
+                dataset_name=dataset_name, data_condition="D4b_D1",
+                model=model, tokenizer=tokenizer, model_id=model_id,
+                output_dir=results_out, test_set=test_tag,
+            )
+
+        d4b_d2_prefix = f"{dataset_name}_D4b_D2_LLM_FSCoT_D4b_{model_tag}_test{test_tag}"
+        if not _skip(results_out / f"{d4b_d2_prefix}_table_performance.csv", f"D4b_D2 test={test_tag}"):
+            print(f"  [D4b FS-CoT] D4b_D2 (demos from D2, test={test_tag})")
+            run_fs_cot_experiment(
+                df_train=df_d2_train, df_test=df_test,
+                dataset_name=dataset_name, data_condition="D4b_D2",
+                model=model, tokenizer=tokenizer, model_id=model_id,
+                output_dir=results_out, test_set=test_tag,
+            )
+
+
+def _run_zeroshot(dataset_name, model, tokenizer, model_id, model_tag, results_out, data_dir, test_size, seed):
+    """ZS_D1 and ZS_D5 — zero-shot baselines on test = D1 only."""
+    for zs_fn, zs_condition in [(run_zs_d1, "ZS_D1"), (run_zs_d5, "ZS_D5")]:
+        prefix = f"{dataset_name}_{zs_condition}_LLM_ZeroShot_{model_tag}"
+        if _skip(results_out / f"{prefix}_table_performance.csv", f"ZeroShot {zs_condition}"):
+            continue
+        print(f"  [ZeroShot] {zs_condition}")
+        zs_fn(
+            dataset_name=dataset_name, model=model, tokenizer=tokenizer,
+            model_id=model_id, test_size=test_size, output_dir=results_out,
+        )
+
+
+def _d4r_predict_on_test(*, df_train, df_test, dataset_name, model, tokenizer,
+                         model_tag, condition, batch_size=8,
+                         checkpoint_path=None, checkpoint_every=10):
+    """One D4r native-reasoning inference pass.
+
+    Uses the domain system prompt (DATASET_PROMPTS), not the fair-CoT instruction.
+    Demos (when df_train is not None) carry input + label only (no visible chain).
+
+    If checkpoint_path is given, the per-instance reasoning log is flushed to
+    that CSV every `checkpoint_every` batches; on restart, already-processed
+    instances (by instance_idx) are reloaded and skipped, so a node reboot mid
+    pass only loses the last unsaved batches instead of the whole ~2.8h pass.
+
+    Returns (y_true, y_pred, t1, t2, reasoning_log).
+    """
+    from prompts import DATASET_PROMPTS
+    from hf_classifier import serialize_row, _is_gptoss, select_fewshot_examples, _parse_response, _generate_batch
+    import numpy as np
+
+    cfg             = DATASET_CONFIG[dataset_name]
+    target_col      = cfg["target"]
+    sensitive_feats = cfg["protected"]
+    privileged_vals = cfg["privileged"]
+    prompts         = DATASET_PROMPTS[dataset_name]
+    system_msg      = prompts["system"]
+    pred_map        = prompts["pred_map"]
+    label_map       = prompts["label_map"]
+    is_gptoss = _is_gptoss(model)
+
+    X_test = df_test[[c for c in df_test.columns if c != target_col]]
+    y_test = df_test[target_col].values
+
+    few_shot_pairs = []
+    if df_train is not None:
+        examples_df = select_fewshot_examples(df_train, target_col, n_examples=10, seed=42)
+        for _, ex in examples_df.iterrows():
+            ex_input = serialize_row(ex, target_col)
+            ex_label = label_map[int(ex[target_col])]
+            few_shot_pairs.append({"role": "user",      "content": ex_input})
+            few_shot_pairs.append({"role": "assistant", "content": ex_label})
+
+    if is_gptoss:
+        system_msg_d4r = system_msg + "\nReasoning: high"
+
+    enable_thinking = not is_gptoss  # gpt-oss reasons via "Reasoning: high"; Gemma-4 via <think>
+    row_texts, messages_all = [], []
+    for _, row in X_test.iterrows():
+        row_text = serialize_row(row, target_col)
+        row_texts.append(row_text)
+        if is_gptoss:
+            messages = (
+                [{"role": "system", "content": system_msg_d4r}]
+                + few_shot_pairs
+                + [{"role": "user", "content": row_text}]
+            )
+        else:
+            # Thinking-capable HF models (e.g. Gemma-4): enable_thinking=True
+            # activates the internal <think> block. The system prompt is folded
+            # into the first user turn when few-shot pairs are present.
+            if few_shot_pairs:
+                first = {"role": "user",
+                         "content": system_msg + "\n\n" + few_shot_pairs[0]["content"]}
+                messages = [first] + few_shot_pairs[1:] + [{"role": "user", "content": row_text}]
+            else:
+                messages = [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": row_text},
+                ]
+        messages_all.append(messages)
+
+    done = {}
+    if checkpoint_path is not None and Path(checkpoint_path).exists():
+        ckpt = pd.read_csv(checkpoint_path)
+        for _, r in ckpt.iterrows():
+            done[int(r["instance_idx"])] = {
+                "instance_idx": int(r["instance_idx"]), "input": r["input"],
+                "reasoning_output": r["reasoning_output"], "prediction": int(r["prediction"]),
+            }
+        print(f"  [D4r] Resuming {condition}: {len(done)}/{len(messages_all)} instances from checkpoint.")
+
+    reasoning_by_idx = dict(done)
+    from tqdm import tqdm as _tqdm
+    pbar = _tqdm(total=len(messages_all), desc=f"[D4r] {condition}")
+    pbar.update(len(done))
+    batches_since_flush = 0
+    for start in range(0, len(messages_all), batch_size):
+        idxs = list(range(start, min(start + batch_size, len(messages_all))))
+        pending = [i for i in idxs if i not in reasoning_by_idx]
+        if not pending:
+            continue
+        batch_messages = [messages_all[i] for i in pending]
+        responses = _generate_batch(model, tokenizer, batch_messages, max_new_tokens=1024,
+                                     temperature=0.0, enable_thinking=enable_thinking)
+        for i, response in zip(pending, responses):
+            pred = _parse_response(response, pred_map, "[D4r]")
+            reasoning_by_idx[i] = {"instance_idx": i, "input": row_texts[i],
+                                   "reasoning_output": response, "prediction": pred}
+        pbar.update(len(pending))
+        batches_since_flush += 1
+        if checkpoint_path is not None and batches_since_flush >= checkpoint_every:
+            pd.DataFrame([reasoning_by_idx[i] for i in sorted(reasoning_by_idx)]).to_csv(
+                checkpoint_path, index=False)
+            batches_since_flush = 0
+    pbar.close()
+
+    reasoning_log = [reasoning_by_idx[i] for i in sorted(reasoning_by_idx)]
+    predictions = [r["prediction"] for r in reasoning_log]
+    y_pred = np.array(predictions)
+    t1, t2 = evaluate_all_sensitive(
+        y_true=y_test, y_pred=y_pred, df=df_test,
+        sensitive_features=sensitive_feats, privileged_values=privileged_vals,
+        model_name=f"LLM_D4r_high_{model_tag} ({condition})",
+        dataset_name=dataset_name,
+    )
+    return y_test, y_pred, t1, t2, reasoning_log
+
+
+def _run_d4r(dataset_name, model, tokenizer, model_id, model_tag, results_out, data_dir, test_size, seed):
+    """D4r native reasoning (D4r_0/D4r_D1/D4r_D2) on test=D1 and test=D2."""
+    target_col = DATASET_CONFIG[dataset_name]["target"]
+
+    df_d1 = pd.read_csv(data_dir / dataset_name / "D1_original.csv")
+    df_d1_train, _ = train_test_split(
+        df_d1, test_size=test_size, random_state=seed, stratify=df_d1[target_col]
+    )
+    df_d2 = pd.read_csv(data_dir / dataset_name / "D2_fair_causal.csv")
+    df_d2_train, _ = train_test_split(
+        df_d2, test_size=test_size, random_state=seed, stratify=df_d2[target_col]
+    )
+
+    test_sets = _get_d4_test_sets(dataset_name, data_dir, test_size, seed)
+
+    # D4r generates long reasoning traces (max_new_tokens=1024), so we use a
+    # smaller batch for >15B models to stay within VRAM. Override via the
+    # D4_BATCH env var if the GPU has more headroom.
+    is_large_model = sum(p.numel() for p in model.parameters()) > 15_000_000_000
+    d4r_batch_size = int(os.environ.get("D4_BATCH", 2 if is_large_model else 8))
+    torch.cuda.empty_cache()
+
+    d4r_specs = [
+        (None,        "D4r_0",  "D4r_0 (no demos)"),
+        (df_d1_train, "D4r_D1", "D4r_D1 (demos from D1)"),
+        (df_d2_train, "D4r_D2", "D4r_D2 (demos from D2)"),
+    ]
+    for df_train_local, cond_label, desc in d4r_specs:
+        for test_tag, df_test in test_sets.items():
+            prefix = f"{dataset_name}_{cond_label}_LLM_D4r_high_{model_tag}_test{test_tag}"
+            if _skip(results_out / f"{prefix}_table_performance.csv", f"D4r {cond_label} test={test_tag}"):
+                continue
+            print(f"  [D4r Native Reasoning] {desc} (test={test_tag})")
+            checkpoint_path = results_out / f"{prefix}_reasoning_log.partial.csv"
+            y_true, y_pred, t1, t2, reasoning_log = _d4r_predict_on_test(
+                df_train=df_train_local, df_test=df_test, dataset_name=dataset_name,
+                model=model, tokenizer=tokenizer, model_tag=model_tag, condition=cond_label,
+                batch_size=d4r_batch_size, checkpoint_path=checkpoint_path,
+            )
+            t1 = t1.copy(); t1["test_set"] = test_tag
+            t2 = t2.copy(); t2["test_set"] = test_tag
+            save_results(t1, t2, results_out, prefix=prefix)
+            log_df = pd.DataFrame(reasoning_log)
+            log_df["test_set"] = test_tag
+            log_df.to_csv(results_out / f"{prefix}_reasoning_log.csv", index=False)
+            pred_df = df_test.copy()
+            pred_df["y_pred"] = y_pred
+            pred_df["y_true"] = y_true
+            pred_df.insert(0, "instance_idx", range(len(pred_df)))
+            pred_df["test_set"] = test_tag
+            pred_df.to_csv(results_out / f"{prefix}_predictions.csv", index=False)
+            if checkpoint_path.exists():
+                checkpoint_path.unlink()
+            print(f"  [D4r] Saved: {prefix}")
+
+
+def _run_decontam(dataset_name, model, tokenizer, model_tag, results_out, data_dir, n_examples, test_size, seed):
+    prefix = f"{dataset_name}_D5_decontam_LLM_FewShot_{model_tag}"
+    if _skip(results_out / f"{prefix}_table_performance.csv", "D5"):
+        return
+
+    print(f"  [D5] Decontamination")
+    cfg        = DATASET_CONFIG[dataset_name]
+    target_col = cfg["target"]
+
+    df_d1 = pd.read_csv(data_dir / dataset_name / "D1_original.csv")
+    df_train_full, df_test = train_test_split(
+        df_d1, test_size=test_size, random_state=seed, stratify=df_d1[target_col]
+    )
+    df_test = df_test.reset_index(drop=True)
+
+    col_map      = build_column_mapping(df_d1, target_col, seed=seed)
+    anon_target  = col_map[target_col]
+    df_test_anon = df_test.rename(columns=col_map)
+    df_train_anon = df_train_full.rename(columns=col_map)
+    prot_anon    = [col_map[f] for f in cfg["protected"]]
+    priv_anon    = {col_map[f]: v for f, v in cfg["privileged"].items()}
+
+    prompts     = DATASET_PROMPTS[dataset_name]
+    examples    = select_fewshot_examples(df_train_anon, anon_target, n_examples, seed=seed)
+    X_test_anon = df_test_anon[[c for c in df_test_anon.columns if c != anon_target]]
+    y_true      = df_test_anon[anon_target].values
+
+    is_large_model = sum(p.numel() for p in model.parameters()) > 15_000_000_000
+    batch_size = 1 if is_large_model else 8
+    torch.cuda.empty_cache()
+
+    y_pred = predict_fewshot(
+        model=model, tokenizer=tokenizer,
+        X_test=X_test_anon, examples_df=examples,
+        system_prompt=_D5_SYSTEM[dataset_name],
+        target_col=anon_target,
+        label_map=prompts["label_map"],
+        pred_map=prompts["pred_map"],
+        batch_size=batch_size,
+    )
+
+    t1, t2 = evaluate_all_sensitive(
+        y_true=y_true, y_pred=y_pred, df=df_test_anon,
+        sensitive_features=prot_anon, privileged_values=priv_anon,
+        model_name=f"LLM_FewShot_{model_tag} (D5_decontam)",
+        dataset_name=dataset_name,
+    )
+    reverse_map = {v: k for k, v in col_map.items()}
+    t1["Feature"] = t1["Feature"].map(reverse_map).fillna(t1["Feature"])
+    t2["Feature"] = t2["Feature"].map(reverse_map).fillna(t2["Feature"])
+    save_results(t1, t2, results_out, prefix=prefix)
+
+    pred_df = df_test.copy()
+    pred_df["y_pred"] = y_pred
+    pred_df["y_true"] = y_true
+    pred_df.insert(0, "instance_idx", range(len(pred_df)))
+    pred_df.to_csv(results_out / f"{prefix}_predictions.csv", index=False)
+
+
+# ---------------------------------------------------------------------------
+# MAIN ENTRY POINT
+# ---------------------------------------------------------------------------
+
+def run_all_experiments(model_id: str, model, tokenizer, datasets: list, results_dir: Path, data_dir: Path, n_examples: int = 10, test_size: int = 500, seed: int = SEED):
+    """Run all experiment conditions for one already-loaded model.
+
+    Args:
+        model_id (str): HuggingFace model identifier.
+        model: Loaded AutoModelForCausalLM.
+        tokenizer: Corresponding tokenizer.
+        datasets (list): Dataset names to evaluate.
+        results_dir (Path): Root directory for results.
+        data_dir (Path): Root directory for data files.
+        n_examples (int): Number of few-shot examples.
+        test_size (int): Test set size per dataset.
+        seed (int): Random seed.
+    """
+    model_tag = model_id.replace("/", "-").replace(".", "-")
+
+    for dataset_name in datasets:
+        results_out = results_dir / dataset_name / model_tag
+        results_out.mkdir(parents=True, exist_ok=True)
+        print(f"\n  Dataset: {dataset_name.upper()}")
+
+        _run_icl(dataset_name, model, tokenizer, model_id, model_tag, results_out, data_dir, n_examples, test_size, seed)
+
+        _run_cot(dataset_name, model, tokenizer, model_id, model_tag, results_out, data_dir, test_size, seed)
+
+        if model_id in HF_D4R_MODELS:
+            _run_d4r(dataset_name, model, tokenizer, model_id, model_tag, results_out, data_dir, test_size, seed)
+
+        _run_zeroshot(dataset_name, model, tokenizer, model_id, model_tag, results_out, data_dir, test_size, seed)
+
+        _run_decontam(dataset_name, model, tokenizer, model_tag, results_out, data_dir, n_examples, test_size, seed)
+
+
+def release_model(model_id: str, model, tokenizer):
+    """Delete model from memory and clear GPU cache.
+
+    Args:
+        model_id (str): Model identifier (for logging).
+        model: Loaded model to delete.
+        tokenizer: Tokenizer to delete.
+    """
+    print(f"\n[mem] Releasing {model_id} from VRAM.")
+    del model, tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        vram_free = torch.cuda.mem_get_info()[0] / 1e9
+        print(f"[mem] Free VRAM after cleanup: {vram_free:.1f} GB")

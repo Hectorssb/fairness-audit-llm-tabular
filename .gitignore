@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment variables
+.env
+.env.*
+
+# Data files — base cache and generated datasets (regenerated on each run)
+data/*.csv
+data/*/D1_original.csv
+data/*/D2_fair_causal.csv
+data/*/D3_resampled.csv
+
+# Experiment outputs are shipped as results.zip (unzip to results/ before analysis).
+# The unzipped directory and intermediate caches are not tracked.
+results/
+analysis/.ipynb_checkpoints/
+
+# Logs — ignore .log files but keep the directory placeholder
+logs/*.log
+
+# Compressed archives (results.zip is tracked as the experiment output bundle)
+*.tar.gz
+*.zip
+*.gz
+!results.zip
+
+# Local HuggingFace model downloads
+models/
+
+# MacOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/

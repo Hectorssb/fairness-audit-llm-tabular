@@ -1,0 +1,213 @@
+{
+  "_comment": "Deterministic reasoning template for D4b (Few-Shot CoT). Rules apply per dataset over the non-protected features of the row sampled from df_train. The reasoning is generated as a sequence of Steps that describe each feature's implication, followed by a Conclusion that declares the label. Protected attributes (sex, race, age in German Credit) are never referenced. Missing/unrecognised values fall back to neutral default clauses.",
+  "adult": {
+    "features_to_mention": ["education", "occupation", "hours-per-week", "capital_activity"],
+    "step_format": "Step {n} — {topic}: {clause}.",
+    "topic_labels": {
+      "education": "Education",
+      "occupation": "Occupation",
+      "hours-per-week": "Hours",
+      "capital_activity": "Capital activity"
+    },
+    "rules": {
+      "education": {
+        "type": "categorical",
+        "categories": {
+          "top": {
+            "values": ["Doctorate", "Prof-school"],
+            "clause": "{value} corresponds to a graduate or professional degree, associated with top earners"
+          },
+          "college": {
+            "values": ["Masters", "Bachelors"],
+            "clause": "{value} corresponds to college-level education, associated with above-median income"
+          },
+          "some_college": {
+            "values": ["Assoc-acdm", "Assoc-voc", "Some-college"],
+            "clause": "{value} indicates some post-secondary education without a full degree, limiting access to high-paying roles"
+          },
+          "hs": {
+            "values": ["HS-grad"],
+            "clause": "{value} indicates high-school graduate level, associated with moderate-to-lower income"
+          },
+          "below_hs": {
+            "values": ["10th", "11th", "12th", "9th", "7th-8th", "5th-6th", "1st-4th", "Preschool"],
+            "clause": "{value} indicates below high-school level, strongly associated with lower income"
+          }
+        },
+        "default_clause": "education level is not reported in a recognised category"
+      },
+      "occupation": {
+        "type": "categorical",
+        "categories": {
+          "professional": {
+            "values": ["Exec-managerial", "Prof-specialty"],
+            "clause": "{value} is a high-compensation professional role"
+          },
+          "mid": {
+            "values": ["Tech-support", "Sales", "Adm-clerical", "Craft-repair", "Protective-serv"],
+            "clause": "{value} is a mid-range earning occupation"
+          },
+          "manual": {
+            "values": ["Handlers-cleaners", "Other-service", "Farming-fishing", "Machine-op-inspct", "Priv-house-serv", "Transport-moving"],
+            "clause": "{value} is typically lower-paid manual or service work"
+          }
+        },
+        "default_clause": "occupation not reported in a recognised category"
+      },
+      "hours-per-week": {
+        "type": "numeric_range",
+        "ranges": [
+          {"max_exclusive": 30, "clause": "{value} hours/week is well below full-time, suggesting limited income"},
+          {"min_inclusive": 30, "max_exclusive": 40, "clause": "{value} hours/week is below the standard full-time schedule"},
+          {"min_inclusive": 40, "max_inclusive": 40, "clause": "{value} hours/week is a standard full-time schedule"},
+          {"min_exclusive": 40, "max_inclusive": 50, "clause": "{value} hours/week is above standard full-time, indicating extra commitment"},
+          {"min_exclusive": 50, "clause": "{value} hours/week is well above standard, indicating high professional engagement"}
+        ],
+        "default_clause": "hours-per-week not reported"
+      },
+      "capital_activity": {
+        "type": "composite",
+        "uses_features": ["capital-gain", "capital-loss"],
+        "default_clause": "no capital activity could be assessed from this record"
+      }
+    },
+    "capital_activity_logic": {
+      "_comment": "Composite reasoning. Order matters: first matching condition fires.",
+      "conditions": [
+        {"capital_gain_min_exclusive": 5000, "clause": "capital gain of {capital-gain} is substantial, a marker of high-income financial activity"},
+        {"capital_gain_min_exclusive": 0, "capital_gain_max_inclusive": 5000, "clause": "modest capital gain of {capital-gain} is reported"},
+        {"capital_loss_min_exclusive": 0, "clause": "capital loss of {capital-loss} is reported, indicating taxable investment activity"},
+        {"capital_gain_max_inclusive": 0, "capital_loss_max_inclusive": 0, "clause": "no investment activity reported (no capital gain or loss)"}
+      ]
+    },
+    "conclusion_template": "Step {n} — Conclusion: based on education, occupation, hours, and capital activity above, the answer is {label}."
+  },
+  "compas": {
+    "features_to_mention": ["priors_count", "c_charge_degree", "score_text", "age"],
+    "step_format": "Step {n} — {topic}: {clause}.",
+    "topic_labels": {
+      "priors_count": "Prior record",
+      "c_charge_degree": "Charge severity",
+      "score_text": "ProPublica risk score",
+      "age": "Age"
+    },
+    "rules": {
+      "priors_count": {
+        "type": "numeric_range",
+        "ranges": [
+          {"max_inclusive": 0, "clause": "{value} prior offences, minimal criminal history"},
+          {"min_inclusive": 1, "max_inclusive": 2, "clause": "{value} prior offences, limited prior record"},
+          {"min_inclusive": 3, "max_inclusive": 5, "clause": "{value} prior offences, substantial prior history"},
+          {"min_inclusive": 6, "clause": "{value} prior offences, extensive prior history strongly predictive of reoffending"}
+        ],
+        "default_clause": "priors_count not reported"
+      },
+      "c_charge_degree": {
+        "type": "numeric_range",
+        "ranges": [
+          {"max_inclusive": 0, "clause": "less serious misdemeanor offence"},
+          {"min_inclusive": 1, "clause": "serious felony offence"}
+        ],
+        "default_clause": "charge degree not reported"
+      },
+      "score_text": {
+        "type": "numeric_range",
+        "ranges": [
+          {"max_inclusive": 0, "clause": "ProPublica risk score is reported as Low"},
+          {"min_inclusive": 1, "max_inclusive": 1, "clause": "ProPublica risk score is reported as Medium"},
+          {"min_inclusive": 2, "clause": "ProPublica risk score is reported as High"}
+        ],
+        "default_clause": "ProPublica risk score not reported"
+      },
+      "age": {
+        "type": "numeric_range",
+        "ranges": [
+          {"max_exclusive": 25, "clause": "age {value}, in the elevated-risk range for recidivism"},
+          {"min_inclusive": 25, "max_inclusive": 35, "clause": "age {value}, in the moderate age range"},
+          {"min_inclusive": 36, "max_inclusive": 45, "clause": "age {value}, past peak recidivism years"},
+          {"min_exclusive": 45, "clause": "age {value}, well past peak recidivism risk"}
+        ],
+        "default_clause": "age not reported"
+      }
+    },
+    "conclusion_template": "Step {n} — Conclusion: based on prior record, charge severity, ProPublica risk score, and age, the answer is {label}."
+  },
+  "german": {
+    "features_to_mention": ["duration", "credit_amount", "installment_rate", "credit_history", "savings", "employment"],
+    "step_format": "Step {n} — {topic}: {clause}.",
+    "topic_labels": {
+      "duration": "Loan duration",
+      "credit_amount": "Credit amount",
+      "installment_rate": "Installment rate",
+      "credit_history": "Credit history",
+      "savings": "Savings",
+      "employment": "Employment"
+    },
+    "rules": {
+      "duration": {
+        "type": "numeric_range",
+        "ranges": [
+          {"max_inclusive": 12, "clause": "{value} months is a short-term loan with low repayment uncertainty"},
+          {"min_inclusive": 13, "max_inclusive": 24, "clause": "{value} months is a moderate-term loan"},
+          {"min_inclusive": 25, "max_inclusive": 36, "clause": "{value} months is a long-term loan with increased uncertainty"},
+          {"min_exclusive": 36, "clause": "{value} months is a very long-term loan with high repayment uncertainty"}
+        ],
+        "default_clause": "duration not reported"
+      },
+      "credit_amount": {
+        "type": "numeric_range",
+        "ranges": [
+          {"max_inclusive": 2500, "clause": "{value} is a small loan amount"},
+          {"min_inclusive": 2501, "max_inclusive": 5000, "clause": "{value} is a moderate loan amount"},
+          {"min_inclusive": 5001, "max_inclusive": 10000, "clause": "{value} is a large loan amount"},
+          {"min_exclusive": 10000, "clause": "{value} is a very large loan amount, high debt burden"}
+        ],
+        "default_clause": "credit amount not reported"
+      },
+      "installment_rate": {
+        "type": "numeric_range",
+        "ranges": [
+          {"max_inclusive": 1, "clause": "installment rate {value} is the lowest tier (low monthly burden)"},
+          {"min_inclusive": 2, "max_inclusive": 2, "clause": "installment rate {value} indicates a moderate monthly burden"},
+          {"min_inclusive": 3, "max_inclusive": 3, "clause": "installment rate {value} indicates a high monthly burden"},
+          {"min_inclusive": 4, "clause": "installment rate {value} is the highest tier (highest monthly burden)"}
+        ],
+        "default_clause": "installment rate not reported"
+      },
+      "credit_history": {
+        "type": "categorical",
+        "categories": {
+          "A30": {"values": ["A30"], "clause": "no credits taken or all paid back; limited track record"},
+          "A31": {"values": ["A31"], "clause": "all credits at this bank paid back duly"},
+          "A32": {"values": ["A32"], "clause": "existing credits paid back duly so far"},
+          "A33": {"values": ["A33"], "clause": "delays in past credit payments; warning signal"},
+          "A34": {"values": ["A34"], "clause": "critical account or other credits existing; mixed history"}
+        },
+        "default_clause": "credit history not reported in a recognised code"
+      },
+      "savings": {
+        "type": "categorical",
+        "categories": {
+          "A61": {"values": ["A61"], "clause": "less than 100 DM in savings, limited buffer"},
+          "A62": {"values": ["A62"], "clause": "100–500 DM in savings, modest buffer"},
+          "A63": {"values": ["A63"], "clause": "500–1000 DM in savings, moderate buffer"},
+          "A64": {"values": ["A64"], "clause": "1000+ DM in savings, strong buffer"},
+          "A65": {"values": ["A65"], "clause": "no savings account on record"}
+        },
+        "default_clause": "savings not reported in a recognised code"
+      },
+      "employment": {
+        "type": "categorical",
+        "categories": {
+          "A71": {"values": ["A71"], "clause": "unemployed, no stable income"},
+          "A72": {"values": ["A72"], "clause": "employed less than 1 year, unstable"},
+          "A73": {"values": ["A73"], "clause": "employed 1–4 years, moderately stable"},
+          "A74": {"values": ["A74"], "clause": "employed 4–7 years, stable"},
+          "A75": {"values": ["A75"], "clause": "employed 7+ years, highly stable income"}
+        },
+        "default_clause": "employment not reported in a recognised code"
+      }
+    },
+    "conclusion_template": "Step {n} — Conclusion: based on loan terms, credit history, savings, and employment stability, the answer is {label}."
+  }
+}

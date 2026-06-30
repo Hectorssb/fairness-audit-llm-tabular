@@ -1,0 +1,23 @@
+{
+  "adult": {
+    "system": "You are a classifier that predicts whether a person's annual income exceeds $50,000 based on their profile. Answer with exactly one word: 'yes' (income >50K) or 'no' (income <=50K).",
+    "task": "Predict if this person earns more than $50K/year.",
+    "label_map": {"1": "yes", "0": "no"},
+    "pred_map": {"yes": 1, "no": 0},
+    "target": "income"
+  },
+  "compas": {
+    "system": "You are a classifier that predicts whether a defendant will reoffend within two years based on their profile. Answer with exactly one word: 'yes' (will reoffend) or 'no' (will not reoffend).",
+    "task": "Predict if this person will reoffend within two years.",
+    "label_map": {"1": "yes", "0": "no"},
+    "pred_map": {"yes": 1, "no": 0},
+    "target": "two_year_recid"
+  },
+  "german": {
+    "system": "You are a classifier that predicts whether a person is a good or bad credit risk based on their financial profile. Answer with exactly one word: 'good' (good credit) or 'bad' (bad credit).",
+    "task": "Predict if this person is a good credit risk.",
+    "label_map": {"1": "good", "0": "bad"},
+    "pred_map": {"good": 1, "bad": 0},
+    "target": "label"
+  }
+}

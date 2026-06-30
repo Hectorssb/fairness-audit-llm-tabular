@@ -1,0 +1,41 @@
+{
+  "title": "A Non-Degenerate Fairness Auditing Framework for LLM-Based Tabular Decision Systems",
+  "description": "<p>Code and experimental outputs accompanying the paper <em>A Non-Degenerate Fairness Auditing Framework for LLM-Based Tabular Decision Systems</em>. The framework evaluates bias-mitigation interventions for tabular classification with Large Language Models under in-context learning, combining data-level interventions (causal fair data via FLAI, resampling, semantic decontamination) and prompt-level interventions (zero-shot and few-shot Chain-of-Thought, native reasoning). Every prompt-level intervention is reported on both the original and the causally corrected test distribution, and fairness is scored by joint EOD+DI compliance after discounting group-level prediction collapse.</p>",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "BSD-3-Clause",
+  "creators": [
+    {
+      "name": "Sánchez San-Blas, Héctor",
+      "orcid": "0000-0003-1808-4364",
+      "affiliation": "Ontology Engineering Group, Universidad Politécnica de Madrid"
+    },
+    {
+      "name": "Serrano, Emilio",
+      "orcid": "0000-0001-7587-0703",
+      "affiliation": "Ontology Engineering Group, Universidad Politécnica de Madrid"
+    },
+    {
+      "name": "González-Sendino, Rubén",
+      "affiliation": "Ontology Engineering Group, Universidad Politécnica de Madrid"
+    },
+    {
+      "name": "Lozano Murciego, Álvaro",
+      "orcid": "0000-0002-0493-4471",
+      "affiliation": "Expert Systems and Applications Laboratory (ESALAB), University of Salamanca"
+    },
+    {
+      "name": "Bajo, Javier",
+      "orcid": "0000-0002-4392-4743",
+      "affiliation": "Ontology Engineering Group, Universidad Politécnica de Madrid"
+    }
+  ],
+  "keywords": [
+    "large language models",
+    "fairness",
+    "tabular classification",
+    "in-context learning",
+    "bias mitigation",
+    "causal models"
+  ]
+}
