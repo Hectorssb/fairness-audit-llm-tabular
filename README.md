@@ -1,5 +1,7 @@
 # fairness-audit-llm-tabular
 
+[![DOI](https://zenodo.org/badge/1284963024.svg)](https://doi.org/10.5281/zenodo.21068577)
+
 Code and experimental outputs accompanying the paper *"A Non-Degenerate Fairness Auditing Framework for LLM-Based Tabular Decision Systems"*.
 
 The framework evaluates bias-mitigation interventions for tabular classification with Large Language Models (LLMs) under in-context learning, combining data-level interventions (causal fair data via FLAI, resampling, semantic decontamination) and prompt-level interventions (zero-shot and few-shot Chain-of-Thought, native reasoning). Every prompt-level intervention is reported on both the original and the causally corrected test distribution, and fairness is scored by joint EOD+DI compliance after discounting group-level prediction collapse.
@@ -121,16 +123,19 @@ Fair data generation (D2, D3) is based on the **FLAI** library (González-Sendin
 ## How to cite
 
 If you use this code or data, please cite the accompanying article and the
-archived software. Machine-readable metadata is provided in
-[`CITATION.cff`](CITATION.cff). The Zenodo DOI will be added here once the
-software release is published.
+archived software (DOI: [10.5281/zenodo.21068577](https://doi.org/10.5281/zenodo.21068577)).
+Machine-readable metadata is provided in [`CITATION.cff`](CITATION.cff).
 
 ```bibtex
-@article{sanchez2026fairnessaudit,
-  title   = {A Non-Degenerate Fairness Auditing Framework for LLM-Based Tabular Decision Systems},
-  author  = {S{\'a}nchez San-Blas, H{\'e}ctor and Serrano, Emilio and
-             Gonz{\'a}lez-Sendino, Rub{\'e}n and Lozano Murciego, {\'A}lvaro and Bajo, Javier},
-  year    = {2026}
+@software{sanchez2026fairnessaudit_software,
+  author    = {S{\'a}nchez San-Blas, H{\'e}ctor and Serrano, Emilio and
+               Gonz{\'a}lez-Sendino, Rub{\'e}n and Lozano Murciego, {\'A}lvaro and Bajo, Javier},
+  title     = {fairness-audit-llm-tabular: A Non-Degenerate Fairness Auditing
+               Framework for LLM-Based Tabular Decision Systems},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.21068577},
+  url       = {https://doi.org/10.5281/zenodo.21068577}
 }
 ```
 

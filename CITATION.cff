@@ -31,9 +31,8 @@ keywords:
   - "bias mitigation"
   - "causal models"
 repository-code: "https://github.com/Hectorssb/fairness-audit-llm-tabular"
-# version: 1.0.0
-# date-released: YYYY-MM-DD
-# doi: 10.5281/zenodo.XXXXXXX   # add the Zenodo DOI after publishing the release
+doi: "10.5281/zenodo.21068577"
+version: "1.0.0"
 preferred-citation:
   type: article
   title: "A Non-Degenerate Fairness Auditing Framework for LLM-Based Tabular Decision Systems"
