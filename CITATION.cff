@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite both the article and the software archive."
-title: "fairness-audit-llm-tabular: A Non-Degenerate Fairness Auditing Framework for LLM-Based Tabular Decision Systems"
+title: "fairness-audit-llm-tabular: When Fairness Metrics Fail: Auditing Collapse and Transfer Risks in LLM Decision Systems"
 type: software
 authors:
   - family-names: "Sánchez San-Blas"
@@ -28,14 +28,15 @@ keywords:
   - "fairness"
   - "tabular classification"
   - "in-context learning"
-  - "bias mitigation"
+  - "fairness auditing"
+  - "prediction collapse"
   - "causal models"
 repository-code: "https://github.com/Hectorssb/fairness-audit-llm-tabular"
 doi: "10.5281/zenodo.21068577"
 version: "1.0.0"
 preferred-citation:
   type: article
-  title: "A Non-Degenerate Fairness Auditing Framework for LLM-Based Tabular Decision Systems"
+  title: "When Fairness Metrics Fail: Auditing Collapse and Transfer Risks in LLM Decision Systems"
   authors:
     - family-names: "Sánchez San-Blas"
       given-names: "Héctor"
@@ -48,5 +49,5 @@ preferred-citation:
     - family-names: "Bajo"
       given-names: "Javier"
   year: 2026
-  # journal: "Knowledge-Based Systems"
+  # journal: "Information Sciences"
   # doi: 10.xxxx/xxxxx   # add the article DOI when available

@@ -2,13 +2,13 @@
 
 [![DOI](https://zenodo.org/badge/1284963024.svg)](https://doi.org/10.5281/zenodo.21068577)
 
-Code and experimental outputs accompanying the paper *"A Non-Degenerate Fairness Auditing Framework for LLM-Based Tabular Decision Systems"*.
+Code and experimental outputs accompanying the paper *"When Fairness Metrics Fail: Auditing Collapse and Transfer Risks in LLM Decision Systems"*.
 
-The framework evaluates bias-mitigation interventions for tabular classification with Large Language Models (LLMs) under in-context learning, combining data-level interventions (causal fair data via FLAI, resampling, semantic decontamination) and prompt-level interventions (zero-shot and few-shot Chain-of-Thought, native reasoning). Every prompt-level intervention is reported on both the original and the causally corrected test distribution, and fairness is scored by joint EOD+DI compliance after discounting group-level prediction collapse.
+The study audits fairness evaluation practice in tabular classification with Large Language Models (LLMs) under in-context learning, using twelve data-level and prompt-level intervention conditions as a testbed: data-level interventions (causal fair data via FLAI, resampling, semantic decontamination) and prompt-level interventions (zero-shot and few-shot Chain-of-Thought, native reasoning). Every prompt-level condition is reported on both the original and the causally corrected test distribution, and fairness is scored by joint EOD+DI compliance after discounting group-level prediction collapse, together with a task-accuracy check against the majority-class baseline.
 
 ## What it does
 
-The framework runs a structured set of experiments on three fairness benchmark datasets (Adult Income, COMPAS Recidivism, German Credit), measuring accuracy and fairness metrics (EOD, DI, SPD, OD) under three experimental blocks:
+The pipeline runs a structured set of experiments on three fairness benchmark datasets (Adult Income, COMPAS Recidivism, German Credit), measuring accuracy and fairness metrics (EOD, DI, SPD, OD) under three experimental blocks:
 
 | Condition | Description |
 |-----------|-------------|
@@ -130,8 +130,8 @@ Machine-readable metadata is provided in [`CITATION.cff`](CITATION.cff).
 @software{sanchez2026fairnessaudit_software,
   author    = {S{\'a}nchez San-Blas, H{\'e}ctor and Serrano, Emilio and
                Gonz{\'a}lez-Sendino, Rub{\'e}n and Lozano Murciego, {\'A}lvaro and Bajo, Javier},
-  title     = {fairness-audit-llm-tabular: A Non-Degenerate Fairness Auditing
-               Framework for LLM-Based Tabular Decision Systems},
+  title     = {fairness-audit-llm-tabular: When Fairness Metrics Fail: Auditing
+               Collapse and Transfer Risks in LLM Decision Systems},
   year      = {2026},
   publisher = {Zenodo},
   doi       = {10.5281/zenodo.21068577},
