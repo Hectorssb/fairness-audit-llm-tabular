@@ -9,9 +9,12 @@ Wrapper over the FLAI library (González-Sendino et al., 2024) to:
 FLAI reference: https://github.com/rugonzs/FLAI
 """
 
+import random
+
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from sklearn.model_selection import train_test_split
 from sklearn.utils import resample
 
 try:
@@ -27,35 +30,75 @@ except ImportError:
 # Columns with more values are automatically discretized into MAX_CARD bins.
 MAX_CARD = 10
 
+# Share of the column a single value must reach to get a bin of its own.
+DOMINANT_VALUE_SHARE = 0.2
+
+
+def _bin_continuous(col: pd.Series, n_bins: int) -> pd.Series:
+    """Assign a bin code to every observation of a continuous column.
+
+    Values concentrating at least ``DOMINANT_VALUE_SHARE`` of the column get a
+    bin of their own, and the remaining observations are split into quantile
+    bins. Point masses such as ``capital-gain == 0`` therefore keep their own
+    representative value instead of being averaged into a bin that spans a
+    large part of the range.
+
+    Args:
+        col: Continuous column.
+        n_bins: Target number of bins.
+
+    Returns:
+        Integer bin codes, contiguous from zero.
+    """
+    counts = col.value_counts()
+    dominant = sorted(counts[counts >= DOMINANT_VALUE_SHARE * len(col)].index)
+
+    codes = pd.Series(0, index=col.index, dtype=int)
+    for code, value in enumerate(dominant):
+        codes[col == value] = code
+
+    rest = col[~col.isin(dominant)]
+    if len(rest) > 0:
+        quantile_bins = max(1, n_bins - len(dominant))
+        rest_codes = pd.qcut(rest, q=quantile_bins, labels=False, duplicates="drop")
+        codes[rest.index] = rest_codes.astype(int) + len(dominant)
+
+    return codes
+
 
 def _discretize_for_flai(df: pd.DataFrame, n_bins: int = 5) -> tuple:
-    """Discretize high-cardinality columns using pd.cut into n_bins bins.
+    """Discretize high-cardinality columns into quantile bins.
     Columns with ≤ MAX_CARD unique values are left intact.
 
     String/categorical columns are label-encoded so FLAI can process them.
     The encoding mapping is returned so callers can restore semantic labels
     in the generated data.
 
-    For continuous numeric columns that are binned, the bin midpoints are
-    recorded in ``num_bin_midpoints`` so the generated data can be
-    inverse-transformed back to interpretable numeric values before saving.
+    Continuous columns are binned by ``_bin_continuous`` and each bin is
+    represented by the empirical median of the observations falling in it.
+    Skewed variables such as ``capital-gain``, where a large fraction of the
+    rows share the minimum value, would otherwise be inverse-transformed to a
+    value that occurs nowhere in the data. Heavily tied columns may yield fewer
+    than ``n_bins`` bins; the representative values are keyed by the bin codes
+    actually produced.
 
     Args:
         df: Input DataFrame.
-        n_bins: Number of bins for continuous high-cardinality columns.
+        n_bins: Target number of bins for continuous high-cardinality columns.
 
     Returns:
         tuple[pd.DataFrame, dict, dict]: Discretized int64 DataFrame, a
-            ``cat_maps`` dict mapping column name -> {int_code: original_str}
-            for every column that was label-encoded from strings, and a
-            ``num_bin_midpoints`` dict mapping column name -> {bin_int: midpoint}
-            for every continuous column that was discretized with pd.cut.
+            ``cat_maps`` dict mapping column name -> {int_code: original_value}
+            for every column that was label-encoded from strings or kept as a
+            low-cardinality integer, and a
+            ``num_bin_midpoints`` dict mapping column name -> {bin_int: value}
+            for every continuous column that was discretized.
     """
     df = df.copy()
     cat_maps = {}
     num_bin_midpoints = {}
     for col in df.columns:
-        if df[col].dtype == object or str(df[col].dtype) == "category":
+        if not pd.api.types.is_numeric_dtype(df[col]):
             # String column: encode to int, record inverse mapping
             categories = sorted(df[col].astype(str).unique())
             code_map = {cat: i for i, cat in enumerate(categories)}
@@ -63,16 +106,15 @@ def _discretize_for_flai(df: pd.DataFrame, n_bins: int = 5) -> tuple:
             cat_maps[col] = inv_map
             df[col] = df[col].astype(str).map(code_map).astype(int)
         elif df[col].nunique() > MAX_CARD:
-            # Continuous column: bin and record midpoints for inverse transform
-            binned, bin_edges = pd.cut(df[col], bins=n_bins, labels=False, retbins=True)
-            midpoints = {
-                i: round((bin_edges[i] + bin_edges[i + 1]) / 2)
-                for i in range(n_bins)
-            }
-            num_bin_midpoints[col] = midpoints
-            df[col] = binned.astype(int)
+            # Continuous column: bin and record a representative value per bin
+            binned = _bin_continuous(df[col], n_bins)
+            representatives = df[col].groupby(binned).median().round().astype(int)
+            num_bin_midpoints[col] = representatives.to_dict()
+            df[col] = binned
         else:
             df[col] = df[col].astype(int)
+            values = sorted(int(v) for v in df[col].unique())
+            cat_maps[col] = {i: v for i, v in enumerate(values)}
     return df, cat_maps, num_bin_midpoints
 
 
@@ -81,12 +123,13 @@ def _restore_categories(df: pd.DataFrame, cat_maps: dict, num_bin_midpoints: dic
 
     Args:
         df: DataFrame with integer-coded columns (as generated by FLAI).
-        cat_maps: Dict {col: {int_code: original_str}} returned by
+        cat_maps: Dict {col: {int_code: original_value}} returned by
             ``_discretize_for_flai``.
-        num_bin_midpoints: Dict {col: {bin_int: midpoint}} returned by
+        num_bin_midpoints: Dict {col: {bin_int: value}} returned by
             ``_discretize_for_flai``. If provided, continuous binned columns
-            are inverse-transformed to their midpoint values so that LLMs
-            receive interpretable numeric values instead of bin indices.
+            are inverse-transformed to their representative values so that
+            LLMs receive interpretable numeric values instead of bin indices.
+            Codes outside the recorded range are clipped to the nearest bin.
 
     Returns:
         DataFrame with string labels and numeric scales restored.
@@ -95,15 +138,22 @@ def _restore_categories(df: pd.DataFrame, cat_maps: dict, num_bin_midpoints: dic
     for col, inv_map in cat_maps.items():
         if col in df.columns:
             # FLAI-generated codes may be floats; cast to int first
+            numeric = all(isinstance(v, int) for v in inv_map.values())
             df[col] = df[col].apply(
-                lambda v: inv_map.get(int(round(v)), str(int(round(v)))) if pd.notna(v) else v
+                lambda v, m=inv_map, numeric=numeric: (
+                    m.get(int(round(v)), int(round(v)) if numeric else str(int(round(v))))
+                    if pd.notna(v) else v
+                )
             )
     if num_bin_midpoints:
-        for col, midpoints in num_bin_midpoints.items():
+        for col, representatives in num_bin_midpoints.items():
             if col in df.columns:
-                n_bins = len(midpoints)
+                codes = sorted(representatives)
+                lo, hi = codes[0], codes[-1]
                 df[col] = df[col].apply(
-                    lambda v: midpoints.get(int(round(v)) % n_bins, midpoints[0]) if pd.notna(v) else v
+                    lambda v, r=representatives, lo=lo, hi=hi: (
+                        r[min(max(int(round(v)), lo), hi)] if pd.notna(v) else v
+                    )
                 )
     return df
 
@@ -112,7 +162,7 @@ def _restore_categories(df: pd.DataFrame, cat_maps: dict, num_bin_midpoints: dic
 # CAUSAL FAIR DATA GENERATION (FLAI)
 # ---------------------------------------------------------------------------
 
-def generate_fair_data_causal(df: pd.DataFrame, target_col: str, sensitive_features: list, n_samples: int = None, method: str = "bayes", save_path: Path = None) -> pd.DataFrame:
+def generate_fair_data_causal(df: pd.DataFrame, target_col: str, sensitive_features: list, n_samples: int = None, method: str = "bayes", save_path: Path = None, seed: int = 42) -> pd.DataFrame:
     """Generate Fair Data using the FLAI mitigated causal model.
 
     Args:
@@ -137,6 +187,9 @@ def generate_fair_data_causal(df: pd.DataFrame, target_col: str, sensitive_featu
     # unique values cause the product to reach millions of combinations.
     # cat_maps captures string→int encodings and num_bin_midpoints captures
     # bin intervals so we can restore interpretable values afterwards.
+    random.seed(seed)
+    np.random.seed(seed)
+
     df_disc, cat_maps, num_bin_midpoints = _discretize_for_flai(df, n_bins=5)
     print(f"[FLAI] Cardinalities after discretization: "
           f"{ {c: df_disc[c].nunique() for c in df_disc.columns} }")
@@ -193,8 +246,9 @@ def generate_fair_data_causal(df: pd.DataFrame, target_col: str, sensitive_featu
         s = flat.sum(axis=0, keepdims=True)
         s[s == 0] = 1
         cpd.values = (flat / s).reshape(raw.shape)
+    graph.graph['model'].check_model()
 
-    print(f"[FLAI] Generating {n_samples} samples (method={method})...")
+    print(f"[FLAI] Generating {n_samples} samples (method={method}, seed={seed})...")
     result = graph.generate_dataset(n_samples=n_samples, methodtype=method)
     fair_df = result.data if hasattr(result, "data") else result
     fair_df = fair_df[[c for c in df.columns if c in fair_df.columns]]
@@ -281,15 +335,22 @@ def generate_resampled_data(df: pd.DataFrame, sensitive_feature: str, privileged
 # MAKE ALL HAPPEN
 # ---------------------------------------------------------------------------
 
-def prepare_all_datasets(df: pd.DataFrame, dataset_name: str, target_col: str, sensitive_features: list, privileged_values: dict, output_dir: Path, n_samples: int = None) -> dict:
-    """Generate the three dataset versions required for the experiment.
+def prepare_all_datasets(df: pd.DataFrame, dataset_name: str, target_col: str, sensitive_features: list, privileged_values: dict, output_dir: Path, test_size: int = 500, seed: int = 42) -> dict:
+    """Generate the canonical split and the dataset versions required for the experiment.
 
-    Versions generated:
-    - D1: original data (direct copy).
-    - D2: causal Fair Data (FLAI).
-    - D3: oversampling resampling on the first protected attribute (baseline).
+    A single stratified train/test split of the original data is fixed first;
+    every derived artifact is generated from D1_train only, so no test row
+    influences discretization, structure learning, CPDs, mitigation or
+    resampling. D1 and D2 test sets are not paired: D2 is an independent
+    synthetic sample from the mitigated causal model, not a row-wise
+    counterfactual of D1.
 
-    Saves everything to output_dir/{dataset_name}/
+    Files generated in output_dir/{dataset_name}/:
+    - D1_train.csv / D1_test.csv : stratified split of the original data.
+    - D2_train.csv / D2_test.csv : causal Fair Data (FLAI fitted on D1_train),
+      split into two disjoint sets of independently sampled records.
+    - D3_train.csv               : oversampling of D1_train on the first
+      protected attribute.
 
     Args:
         df: Preprocessed original DataFrame.
@@ -298,51 +359,71 @@ def prepare_all_datasets(df: pd.DataFrame, dataset_name: str, target_col: str, s
         sensitive_features: List of protected attributes.
         privileged_values: Dictionary {feature: privileged_value}.
         output_dir: Root output directory.
-        n_samples: Samples to generate for D2. None = same count as df.
+        test_size: Number of test instances in the canonical split.
+        seed: Random seed for the canonical split.
 
     Returns:
-        Dictionary with keys 'D1', 'D2', 'D3' and their loaded DataFrames.
+        Dictionary with keys 'D1_train', 'D1_test', 'D2_train', 'D2_test',
+        'D3_train' and their loaded DataFrames.
     """
     out = output_dir / dataset_name
     out.mkdir(parents=True, exist_ok=True)
 
-    # D1 — Original
-    d1_path = out / "D1_original.csv"
-    df.to_csv(d1_path, index=False)
-    print(f"\n[D1] Original saved: {d1_path}")
-
-    # D2 — Causal Fair Data
-    d2_path = out / "D2_fair_causal.csv"
-    if d2_path.exists():
-        print(f"\n[D2] Already exists, skipping generation: {d2_path}")
+    # D1 — canonical stratified split
+    d1_train_path = out / "D1_train.csv"
+    d1_test_path  = out / "D1_test.csv"
+    if d1_train_path.exists() and d1_test_path.exists():
+        print(f"\n[D1] Split already exists, skipping: {d1_train_path}")
+        df_train = pd.read_csv(d1_train_path)
+        df_test  = pd.read_csv(d1_test_path)
     else:
-        print("\n[D2] Generating causal Fair Data")
-        generate_fair_data_causal(
-            df=df,
+        df_train, df_test = train_test_split(
+            df, test_size=test_size, random_state=seed, stratify=df[target_col]
+        )
+        df_train = df_train.reset_index(drop=True)
+        df_test  = df_test.reset_index(drop=True)
+        df_train.to_csv(d1_train_path, index=False)
+        df_test.to_csv(d1_test_path, index=False)
+        print(f"\n[D1] Canonical split saved: {len(df_train)} train / {len(df_test)} test")
+
+    # D2 — Causal Fair Data, fitted on D1_train only
+    d2_train_path = out / "D2_train.csv"
+    d2_test_path  = out / "D2_test.csv"
+    if d2_train_path.exists() and d2_test_path.exists():
+        print(f"\n[D2] Already exists, skipping generation: {d2_train_path}")
+    else:
+        print("\n[D2] Generating causal Fair Data from D1_train")
+        fair_df = generate_fair_data_causal(
+            df=df_train,
             target_col=target_col,
             sensitive_features=sensitive_features,
-            n_samples=n_samples,
-            save_path=d2_path,
+            n_samples=len(df_train) + len(df_test),
+            seed=seed,
         )
+        fair_df.iloc[:len(df_train)].reset_index(drop=True).to_csv(d2_train_path, index=False)
+        fair_df.iloc[len(df_train):].reset_index(drop=True).to_csv(d2_test_path, index=False)
+        print(f"[D2] Saved: {len(df_train)} train / {len(df_test)} test synthetic samples")
 
-    # D3 — Resampling (uses the first protected attribute as primary)
+    # D3 — Resampling of D1_train (uses the first protected attribute as primary)
     primary_sensitive = sensitive_features[0]
-    d3_path = out / "D3_resampled.csv"
-    if d3_path.exists():
-        print(f"\n[D3] Already exists, skipping generation: {d3_path}")
+    d3_train_path = out / "D3_train.csv"
+    if d3_train_path.exists():
+        print(f"\n[D3] Already exists, skipping generation: {d3_train_path}")
     else:
-        print("\n[D3] Generating resampled data")
+        print("\n[D3] Generating resampled data from D1_train")
         generate_resampled_data(
-            df=df,
+            df=df_train,
             sensitive_feature=primary_sensitive,
             privileged_value=privileged_values[primary_sensitive],
             strategy="oversample",
-            save_path=d3_path,
+            save_path=d3_train_path,
         )
 
     print(f"\n[prepare_all_datasets] Completed for '{dataset_name}'.")
     return {
-        "D1": pd.read_csv(d1_path),
-        "D2": pd.read_csv(d2_path),
-        "D3": pd.read_csv(d3_path),
+        "D1_train": pd.read_csv(d1_train_path),
+        "D1_test":  pd.read_csv(d1_test_path),
+        "D2_train": pd.read_csv(d2_train_path),
+        "D2_test":  pd.read_csv(d2_test_path),
+        "D3_train": pd.read_csv(d3_train_path),
     }

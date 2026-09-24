@@ -1,5 +1,5 @@
 """
-Central prompt registry for the fairness-audit experiments.
+Central prompt registry for the experiments.
 
 All prompts and few-shot examples are stored as JSON files in this directory
 so they can be edited independently of the Python code (ablation studies,
@@ -12,6 +12,7 @@ Exported names (imported by classifiers):
     D4B_REASONING_TEMPLATE  — deterministic reasoning rules for D4b
     ZS_D5_SYSTEM_PROMPTS    — generic system prompts for zero-shot decontam (ZS_D5)
     D5_SYSTEM               — generic system prompts for few-shot decontam (D5)
+    D6_SYSTEM               — explicit debiasing-instruction prompts for D6
 """
 
 import json
@@ -61,3 +62,9 @@ D4B_REASONING_TEMPLATE: dict = _load("d4b_reasoning_template.json")
 ZS_D5_SYSTEM_PROMPTS: dict = _load("zs_d5_system_prompts.json")
 
 D5_SYSTEM: dict = _load("d5_system_prompts.json")
+
+# ---------------------------------------------------------------------------
+# Fair-prompt condition (D6)
+# ---------------------------------------------------------------------------
+
+D6_SYSTEM: dict = _load("d6_system_prompts.json")

@@ -33,7 +33,7 @@ keywords:
   - "causal models"
 repository-code: "https://github.com/Hectorssb/fairness-audit-llm-tabular"
 doi: "10.5281/zenodo.21068577"
-version: "1.0.1"
+version: "2.0.0"
 preferred-citation:
   type: article
   title: "When Fairness Metrics Fail: Auditing Collapse and Transfer Risks in LLM Decision Systems"

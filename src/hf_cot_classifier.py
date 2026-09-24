@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from data_loader import DATASET_CONFIG
 from metrics import evaluate_all_sensitive, save_results
-from hf_classifier import serialize_row, _generate, _generate_batch, _is_gptoss, select_fewshot_examples
+from hf_classifier import serialize_row, _generate_batch, _is_gptoss, select_fewshot_examples, _length_sorted_order, save_generation_stats, demo_seed_suffix, GPTOSS_MIN_TOKENS, _batch_sizes, _parse_response, _finish_unanswered
 from prompts import D4_SYSTEM_PROMPTS, D4_CONFIG
 from reasoning_generator import generate_reasoning
 
@@ -25,12 +25,10 @@ from reasoning_generator import generate_reasoning
 def _cot_batch_size(model) -> int:
     """Batch size for CoT generation (D4a/D4b).
 
-    Smaller batch for >15B models to stay within VRAM (CoT traces are long).
-    Override via the D4_BATCH env var if the GPU has more headroom.
+    Override via the D4_BATCH env var. See ``BATCH_SIZES``.
     """
     import os
-    is_large_model = sum(p.numel() for p in model.parameters()) > 15_000_000_000
-    return int(os.environ.get("D4_BATCH", 2 if is_large_model else 8))
+    return int(os.environ.get("D4_BATCH", _batch_sizes(model)["d4"]))
 
 
 # ---------------------------------------------------------------------------
@@ -40,8 +38,9 @@ def _cot_batch_size(model) -> int:
 def parse_cot_response(response_text: str, pred_map: dict) -> tuple:
     """Extract the final prediction from a CoT response.
 
-    Strategy: scan the last 3 non-empty lines for a valid label word.
-    Fallback: last occurrence anywhere in the full text.
+    Same rule as the other conditions where the line that states the answer wins.
+    A label mentioned in the reasoning is a fallback only. An unparseable
+    response is counted as a parse failure.
 
     Args:
         response_text (str): Full generated text (reasoning + answer).
@@ -50,30 +49,14 @@ def parse_cot_response(response_text: str, pred_map: dict) -> tuple:
     Returns:
         tuple[int, str]: (int_prediction, full_cot_text).
     """
-    lines = [l.strip() for l in response_text.strip().split("\n") if l.strip()]
-
-    for line in reversed(lines[-3:]):
-        cleaned = line.lower().strip(".,!?;: \"'*#")
-        for key in pred_map:
-            if cleaned == key or cleaned.endswith(key):
-                return pred_map[key], response_text
-            if re.search(rf'\b{re.escape(key)}\b', cleaned):
-                return pred_map[key], response_text
-
-    # Fallback: last occurrence in full text
-    positions = {key: response_text.lower().rfind(key) for key in pred_map}
-    best = max(positions, key=lambda k: positions[k])
-    if positions[best] != -1:
-        return pred_map[best], response_text
-
-    return 0, response_text
+    return _parse_response(response_text, pred_map, "[hf_cot]"), response_text
 
 
 # ---------------------------------------------------------------------------
 # D4a — ZERO-SHOT COT PREDICTION
 # ---------------------------------------------------------------------------
 
-def predict_zs_cot(model, tokenizer, X_test: pd.DataFrame, dataset_name: str, max_new_tokens: int = 512, temperature: float = 0.0, verbose: bool = True, batch_size: int = 8) -> tuple:
+def predict_zs_cot(model, tokenizer, X_test: pd.DataFrame, dataset_name: str, max_new_tokens: int = 1024, temperature: float = 0.0, verbose: bool = True, batch_size: int = 8) -> tuple:
     """Zero-shot CoT prediction (D4a, Kojima et al. 2022).
 
     No few-shot examples. The trigger phrase is appended to each user message
@@ -84,7 +67,7 @@ def predict_zs_cot(model, tokenizer, X_test: pd.DataFrame, dataset_name: str, ma
         tokenizer: Corresponding tokenizer.
         X_test (pd.DataFrame): Test features (without target).
         dataset_name (str): Dataset name.
-        max_new_tokens (int): Max tokens to generate (512 to allow full chain).
+        max_new_tokens (int): Max tokens to generate (1024 to allow full chain).
         temperature (float): Sampling temperature (0 = greedy).
         verbose (bool): Show tqdm progress bar.
 
@@ -101,13 +84,12 @@ def predict_zs_cot(model, tokenizer, X_test: pd.DataFrame, dataset_name: str, ma
 
     gptoss = _is_gptoss(model)
     effective_system = (system_msg + "\nReasoning: low") if gptoss else system_msg
-    effective_max    = max(max_new_tokens, 256) if gptoss else max_new_tokens
+    effective_max    = max(max_new_tokens, GPTOSS_MIN_TOKENS) if gptoss else max_new_tokens
 
     # Zero-shot CoT trigger appended to each user message
     ZS_COT_TRIGGER = "\nThink step by step, considering only non-protected features, then give your final answer on the last line."
 
-    # Build all per-instance messages first, then generate in batches. Prompt
-    # construction is identical to the one-at-a-time path; only generation is batched.
+    # Build all per-instance messages first, then generate in batches. 
     row_texts = [serialize_row(row, target_col) + ZS_COT_TRIGGER for _, row in X_test.iterrows()]
     messages_all = [
         [{"role": "system", "content": effective_system},
@@ -115,20 +97,25 @@ def predict_zs_cot(model, tokenizer, X_test: pd.DataFrame, dataset_name: str, ma
         for rt in row_texts
     ]
 
-    predictions, cot_log = [], []
+    order = _length_sorted_order(tokenizer, row_texts)
+    predictions, cot_log = [0] * len(messages_all), []
     pbar = tqdm(total=len(messages_all), desc="[hf_cot] D4a ZS-CoT") if verbose else None
-    for start in range(0, len(messages_all), batch_size):
-        batch_messages = messages_all[start:start + batch_size]
-        responses = _generate_batch(model, tokenizer, batch_messages, effective_max, temperature)
-        for offset, response in enumerate(responses):
-            i = start + offset
+    for start in range(0, len(order), batch_size):
+        batch_idx = order[start:start + batch_size]
+        batch_messages = [messages_all[j] for j in batch_idx]
+        responses = _generate_batch(model, tokenizer, batch_messages, effective_max, temperature,
+                                     open_answer_channel=False)
+        responses = _finish_unanswered(model, tokenizer, batch_messages, responses,
+                                       pred_map, "[hf_cot]")
+        for i, response in zip(batch_idx, responses):
             pred, cot_text = parse_cot_response(response, pred_map)
             cot_log.append({"instance_idx": i, "input": row_texts[i], "cot_output": cot_text, "prediction": pred})
-            predictions.append(pred)
+            predictions[i] = pred
         if pbar:
             pbar.update(len(batch_messages))
     if pbar:
         pbar.close()
+    cot_log.sort(key=lambda entry: entry["instance_idx"])
 
     return np.array(predictions), cot_log
 
@@ -139,7 +126,7 @@ def predict_zs_cot(model, tokenizer, X_test: pd.DataFrame, dataset_name: str, ma
 
 def predict_fs_cot(model, tokenizer, X_test: pd.DataFrame, dataset_name: str,
                    df_train: pd.DataFrame, n_examples: int = 10, seed: int = 42,
-                   max_new_tokens: int = 512, temperature: float = 0.0,
+                   max_new_tokens: int = 1024, temperature: float = 0.0,
                    verbose: bool = True, batch_size: int = 8) -> tuple:
     """Few-shot CoT prediction (D4b, Wei et al. 2022) with dynamic demos.
 
@@ -181,10 +168,9 @@ def predict_fs_cot(model, tokenizer, X_test: pd.DataFrame, dataset_name: str,
 
     gptoss = _is_gptoss(model)
     effective_system = (system_msg + "\nReasoning: low") if gptoss else system_msg
-    effective_max    = max(max_new_tokens, 256) if gptoss else max_new_tokens
+    effective_max    = max(max_new_tokens, GPTOSS_MIN_TOKENS) if gptoss else max_new_tokens
 
-    # Build all per-instance messages first, then generate in batches. Prompt
-    # construction is identical to the one-at-a-time path; only generation is batched.
+    # Build all per-instance messages first, then generate in batches.
     row_texts = [serialize_row(row, target_col) for _, row in X_test.iterrows()]
     messages_all = [
         [{"role": "system", "content": effective_system}]
@@ -193,20 +179,25 @@ def predict_fs_cot(model, tokenizer, X_test: pd.DataFrame, dataset_name: str,
         for rt in row_texts
     ]
 
-    predictions, cot_log = [], []
+    order = _length_sorted_order(tokenizer, row_texts)
+    predictions, cot_log = [0] * len(messages_all), []
     pbar = tqdm(total=len(messages_all), desc="[hf_cot] D4b FS-CoT") if verbose else None
-    for start in range(0, len(messages_all), batch_size):
-        batch_messages = messages_all[start:start + batch_size]
-        responses = _generate_batch(model, tokenizer, batch_messages, effective_max, temperature)
-        for offset, response in enumerate(responses):
-            i = start + offset
+    for start in range(0, len(order), batch_size):
+        batch_idx = order[start:start + batch_size]
+        batch_messages = [messages_all[j] for j in batch_idx]
+        responses = _generate_batch(model, tokenizer, batch_messages, effective_max, temperature,
+                                     open_answer_channel=False)
+        responses = _finish_unanswered(model, tokenizer, batch_messages, responses,
+                                       pred_map, "[hf_cot]")
+        for i, response in zip(batch_idx, responses):
             pred, cot_text = parse_cot_response(response, pred_map)
             cot_log.append({"instance_idx": i, "input": row_texts[i], "cot_output": cot_text, "prediction": pred})
-            predictions.append(pred)
+            predictions[i] = pred
         if pbar:
             pbar.update(len(batch_messages))
     if pbar:
         pbar.close()
+    cot_log.sort(key=lambda entry: entry["instance_idx"])
 
     return np.array(predictions), cot_log
 
@@ -250,6 +241,7 @@ def run_zs_cot_experiment(df_test: pd.DataFrame, dataset_name: str, data_conditi
         suffix = f"_test{test_set}" if test_set is not None else ""
         prefix = f"{dataset_name}_{data_condition}_{model_label}{suffix}"
         save_results(t1, t2, output_dir, prefix=prefix)
+        save_generation_stats(output_dir, prefix, D4_SYSTEM_PROMPTS[dataset_name])
         cot_df = pd.DataFrame(cot_log)
         if test_set is not None:
             cot_df["test_set"] = test_set
@@ -269,11 +261,13 @@ def run_zs_cot_experiment(df_test: pd.DataFrame, dataset_name: str, data_conditi
 def run_fs_cot_experiment(df_train: pd.DataFrame, df_test: pd.DataFrame,
                           dataset_name: str, data_condition: str,
                           model, tokenizer, model_id: str,
-                          output_dir: Path = None, test_set: str = None) -> tuple:
+                          output_dir: Path = None, test_set: str = None,
+                          demo_seed: int = 42) -> tuple:
     """Run D4b (few-shot CoT) with dynamic demos sampled from df_train.
 
     When test_set is set ('D1' or 'D2'), output filenames get a `_test<tag>`
-    suffix and CSVs carry a `test_set` column.
+    suffix and CSVs carry a `test_set` column. A non-default demo_seed adds a
+    `_seed<n>` suffix and changes the demonstration sample and order.
 
     Returns (y_true, y_pred, t1, t2, cot_log).
     """
@@ -290,7 +284,7 @@ def run_fs_cot_experiment(df_train: pd.DataFrame, df_test: pd.DataFrame,
     y_pred, cot_log = predict_fs_cot(
         model=model, tokenizer=tokenizer, X_test=X_test,
         dataset_name=dataset_name, df_train=df_train,
-        batch_size=_cot_batch_size(model),
+        seed=demo_seed, batch_size=_cot_batch_size(model),
     )
 
     t1, t2 = evaluate_all_sensitive(
@@ -304,8 +298,9 @@ def run_fs_cot_experiment(df_train: pd.DataFrame, df_test: pd.DataFrame,
 
     if output_dir:
         suffix = f"_test{test_set}" if test_set is not None else ""
-        prefix = f"{dataset_name}_{data_condition}_{model_label}{suffix}"
+        prefix = f"{dataset_name}_{data_condition}_{model_label}{suffix}{demo_seed_suffix(demo_seed)}"
         save_results(t1, t2, output_dir, prefix=prefix)
+        save_generation_stats(output_dir, prefix, D4_SYSTEM_PROMPTS[dataset_name])
         cot_df = pd.DataFrame(cot_log)
         if test_set is not None:
             cot_df["test_set"] = test_set

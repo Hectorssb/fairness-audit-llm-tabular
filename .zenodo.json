@@ -1,6 +1,6 @@
 {
-  "title": "A Non-Degenerate Fairness Auditing Framework for LLM-Based Tabular Decision Systems",
-  "description": "<p>Code and experimental outputs accompanying the paper <em>A Non-Degenerate Fairness Auditing Framework for LLM-Based Tabular Decision Systems</em>. The framework evaluates bias-mitigation interventions for tabular classification with Large Language Models under in-context learning, combining data-level interventions (causal fair data via FLAI, resampling, semantic decontamination) and prompt-level interventions (zero-shot and few-shot Chain-of-Thought, native reasoning). Every prompt-level intervention is reported on both the original and the causally corrected test distribution, and fairness is scored by joint EOD+DI compliance after discounting group-level prediction collapse.</p>",
+  "title": "When Fairness Metrics Fail: Auditing Collapse and Transfer Risks in LLM Decision Systems",
+  "description": "<p>Code and experimental outputs accompanying the paper <em>When Fairness Metrics Fail: Auditing Collapse and Transfer Risks in LLM Decision Systems</em>. The study audits fairness evaluation practice in tabular classification with Large Language Models under in-context learning, using thirteen data-level and prompt-level intervention conditions as a testbed: data-level interventions (causal fair data via FLAI, resampling, semantic decontamination) and prompt-level interventions (zero-shot and few-shot Chain-of-Thought, native reasoning, debiasing instruction). Every condition is reported on both the original and the causally corrected test distribution, and fairness is scored by joint EOD+DI compliance after discounting group-level prediction collapse, together with a task-accuracy check against the majority-class baseline. Retrainable XGBoost baselines covering pre-, in- and post-processing mitigation are evaluated on the same canonical splits.</p>",
   "upload_type": "software",
   "access_right": "open",
   "license": "BSD-3-Clause",
@@ -36,6 +36,8 @@
     "tabular classification",
     "in-context learning",
     "bias mitigation",
-    "causal models"
+    "causal models",
+    "prediction collapse",
+    "fairness auditing"
   ]
 }

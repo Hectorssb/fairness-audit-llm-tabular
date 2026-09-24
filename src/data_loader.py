@@ -25,6 +25,64 @@ COMPAS_URL = (
     "master/compas-scores-two-years.csv"
 )
 
+# German Credit column map following the official UCI Statlog codebook
+# (https://archive.ics.uci.edu/dataset/144): Attribute1 is checking-account
+# status (A11-A14), Attribute3 is credit history (A30-A34), Attribute15 is
+# housing (A151-A153) and Attribute17 is job (A171-A174).
+GERMAN_COLUMN_MAP = {
+    "Attribute1": "checking_status", "Attribute2": "duration",
+    "Attribute3": "credit_history", "Attribute4": "purpose",
+    "Attribute5": "credit_amount", "Attribute6": "savings",
+    "Attribute7": "employment", "Attribute8": "installment_rate",
+    "Attribute9": "sex", "Attribute10": "other_debtors",
+    "Attribute12": "property", "Attribute13": "age",
+    "Attribute15": "housing", "Attribute17": "job",
+    "class": "label"
+}
+
+
+# Column layout each loader produces, in order. Used to detect caches written
+# by an earlier layout.
+ADULT_COLUMNS = [
+    "workclass", "hours-per-week", "sex", "age", "race",
+    "occupation", "capital-loss", "education",
+    "capital-gain", "marital-status", "relationship", "income",
+]
+COMPAS_COLUMNS = [
+    "sex", "race", "age", "c_charge_degree", "priors_count", "two_year_recid",
+]
+GERMAN_COLUMNS = list(GERMAN_COLUMN_MAP.values())
+
+
+def _read_cache(cache: Path, expected_columns: list, name: str):
+    """Return the cached DataFrame, or None when it does not match the loader.
+
+    A cache written by an earlier column layout would otherwise shadow the
+    loader and silently feed the experiment stale data, so a cache whose
+    columns differ from the ones the loader produces today is discarded.
+
+    Args:
+        cache: Path of the cached CSV.
+        expected_columns: Columns the loader produces.
+        name: Dataset name, for logging.
+
+    Returns:
+        pd.DataFrame or None.
+    """
+    if not cache.exists():
+        return None
+
+    df = pd.read_csv(cache)
+    if list(df.columns) != list(expected_columns):
+        stale = sorted(set(df.columns) - set(expected_columns))
+        missing = sorted(set(expected_columns) - set(df.columns))
+        print(f"[data_loader] {name}: ignoring stale cache "
+              f"(unexpected={stale}, missing={missing}); regenerating.")
+        return None
+
+    print(f"[data_loader] {name} loaded from cache: {df.shape}")
+    return df
+
 
 def load_adult(save=True):
     """Load the Adult Income dataset from UCI or from local cache.
@@ -42,10 +100,9 @@ def load_adult(save=True):
         pd.DataFrame: DataFrame with selected and preprocessed columns.
     """
     cache = DATA_DIR / "adult.csv"
-    if cache.exists():
-        df = pd.read_csv(cache)
-        print(f"[data_loader] Adult loaded from cache: {df.shape}")
-        return df
+    cached = _read_cache(cache, ADULT_COLUMNS, "Adult")
+    if cached is not None:
+        return cached
 
     print("[data_loader] Downloading Adult from UCI...")
     dataset = fetch_ucirepo(id=2)
@@ -55,13 +112,8 @@ def load_adult(save=True):
     df.columns = [c.strip() for c in df.columns]
     df = df.replace("?", np.nan).dropna()
 
-    features_keep = [
-        "workclass", "hours-per-week", "sex", "age", "race",
-        "occupation", "capital-loss", "education",
-        "capital-gain", "marital-status", "relationship"
-    ]
     target_col = "income"
-    df = df[features_keep + [target_col]].copy()
+    df = df[ADULT_COLUMNS].copy()
 
     # Original label may include variants like ">50K." (with trailing dot)
     df[target_col] = (df[target_col].str.strip().str.startswith(">50K")).astype(int)
@@ -69,7 +121,6 @@ def load_adult(save=True):
     df["race"] = (df["race"].str.strip() == "White").astype(int)
 
     # Keep categorical columns as strings so LLMs receive semantic labels
-    # (e.g. "Bachelors" instead of an arbitrary integer).
     cat_cols = ["workclass", "occupation", "education", "marital-status", "relationship"]
     for col in cat_cols:
         df[col] = df[col].astype(str).str.strip()
@@ -89,7 +140,6 @@ def load_compas(save=True):
     - Excludes ordinance charges ('O') and score_text == 'N/A'.
     - Binarizes ``race`` (1 if NOT African-American, 0 otherwise).
     - Binarizes ``sex`` (1=Male) and ``c_charge_degree`` (1=Felony).
-    - Encodes ``score_text`` on an ordinal scale 0-2 (Low/Medium/High).
 
     Args:
         save (bool): If True, saves the processed DataFrame to ``data/compas.csv``.
@@ -98,10 +148,9 @@ def load_compas(save=True):
         pd.DataFrame: DataFrame with selected and preprocessed columns.
     """
     cache = DATA_DIR / "compas.csv"
-    if cache.exists():
-        df = pd.read_csv(cache)
-        print(f"[data_loader] COMPAS loaded from cache: {df.shape}")
-        return df
+    cached = _read_cache(cache, COMPAS_COLUMNS, "COMPAS")
+    if cached is not None:
+        return cached
 
     print("[data_loader] Downloading COMPAS from ProPublica...")
     raw = pd.read_csv(COMPAS_URL)
@@ -112,7 +161,7 @@ def load_compas(save=True):
     raw = raw[raw["c_charge_degree"] != "O"]
     raw = raw[raw["score_text"] != "N/A"]
 
-    features_keep = ["sex", "race", "age", "c_charge_degree", "priors_count", "score_text"]
+    features_keep = ["sex", "race", "age", "c_charge_degree", "priors_count"]
     target_col = "two_year_recid"
     df = raw[features_keep + [target_col]].copy()
 
@@ -120,9 +169,6 @@ def load_compas(save=True):
     df["race"] = (df["race"] != "African-American").astype(int)
     df["sex"] = (df["sex"] == "Male").astype(int)
     df["c_charge_degree"] = (df["c_charge_degree"] == "F").astype(int)
-
-    score_map = {"Low": 0, "Medium": 1, "High": 2}
-    df["score_text"] = df["score_text"].map(score_map)
 
     if save:
         df.to_csv(cache, index=False)
@@ -133,7 +179,8 @@ def load_compas(save=True):
 def load_german(save=True):
     """Load the German Credit dataset from UCI or from local cache.
 
-    Renames generic columns to descriptive names and applies the following transformations:
+    Renames generic columns to descriptive names per the official UCI codebook
+    (GERMAN_COLUMN_MAP) and applies the following transformations:
     - Binarizes ``label`` (1=good credit, 0=bad credit).
     - Binarizes ``sex`` based on codes A91/A93/A94 (male=1).
     - Binarizes ``age`` (1 if >= 25 years, standard threshold in the literature).
@@ -146,10 +193,9 @@ def load_german(save=True):
         pd.DataFrame: DataFrame with selected and preprocessed columns.
     """
     cache = DATA_DIR / "german.csv"
-    if cache.exists():
-        df = pd.read_csv(cache)
-        print(f"[data_loader] German loaded from cache: {df.shape}")
-        return df
+    cached = _read_cache(cache, GERMAN_COLUMNS, "German")
+    if cached is not None:
+        return cached
 
     print("[data_loader] Downloading German Credit from UCI...")
     dataset = fetch_ucirepo(id=144)
@@ -158,18 +204,7 @@ def load_german(save=True):
     df = pd.concat([features, targets], axis=1)
     df.columns = [c.strip() for c in df.columns]
 
-    # Column name map: generic UCI names -> descriptive names
-    col_map = {
-        "Attribute1": "credit_history", "Attribute2": "duration",
-        "Attribute3": "credit_history_detail", "Attribute4": "purpose",
-        "Attribute5": "credit_amount", "Attribute6": "savings",
-        "Attribute7": "employment", "Attribute8": "installment_rate",
-        "Attribute9": "sex", "Attribute10": "other_debtors",
-        "Attribute12": "property", "Attribute13": "age",
-        "Attribute19": "housing", "Attribute20": "job",
-        "class": "label"
-    }
-    filtered_column_map = {k: v for k, v in col_map.items() if k in df.columns}
+    filtered_column_map = {k: v for k, v in GERMAN_COLUMN_MAP.items() if k in df.columns}
     df = df[list(filtered_column_map.keys())].rename(columns=filtered_column_map)
 
     df["label"] = (df["label"] == 1).astype(int)
@@ -183,7 +218,6 @@ def load_german(save=True):
         df["age"] = (df["age"] >= 25).astype(int)
 
     # Keep categorical columns as strings so LLMs receive semantic labels
-    # (e.g. "A12" instead of an arbitrary integer).
     cat_cols = [c for c in df.columns if df[c].dtype == object and c not in ["sex", "age", "label"]]
     for col in cat_cols:
         df[col] = df[col].astype(str).str.strip()

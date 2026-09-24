@@ -10,11 +10,10 @@ import random
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 from data_loader import DATASET_CONFIG
-from hf_classifier import DATASET_PROMPTS, serialize_row, _generate_batch, _parse_response, _is_gptoss
+from hf_classifier import DATASET_PROMPTS, serialize_row, _generate_batch, _parse_response, _is_gptoss, save_generation_stats, GPTOSS_MIN_TOKENS
 from metrics import evaluate_all_sensitive, save_results, print_results
 from prompts import ZS_D5_SYSTEM_PROMPTS
 
@@ -75,8 +74,8 @@ def predict_zeroshot(model, tokenizer, X_test: pd.DataFrame, system_prompt: str,
     rows = [row for _, row in X_test.iterrows()]
     predictions = []
     gptoss = _is_gptoss(model)
-    effective_system = (system_prompt + "\nReasoning: low") if gptoss else system_prompt
-    effective_max    = max(max_new_tokens, 256) if gptoss else max_new_tokens
+    effective_system = system_prompt
+    effective_max    = max(max_new_tokens, GPTOSS_MIN_TOKENS) if gptoss else max_new_tokens
 
     pbar = tqdm(total=len(rows), desc="[hf_zeroshot] Predicting") if verbose else None
     for i in range(0, len(rows), batch_size):
@@ -101,18 +100,19 @@ def predict_zeroshot(model, tokenizer, X_test: pd.DataFrame, system_prompt: str,
 # EXPERIMENT FUNCTIONS
 # ---------------------------------------------------------------------------
 
-def run_zs_d1(dataset_name: str, model, tokenizer, model_id: str, test_size: int = 500, output_dir: Path = None) -> tuple:
+def run_zs_d1(dataset_name: str, model, tokenizer, model_id: str, output_dir: Path = None, test_tag: str = "D1") -> tuple:
     """Zero-shot with original column names (ZS_D1).
 
     Measures the model's prior over tabular data with semantic context.
+    Evaluates on the canonical test split named by `test_tag`.
 
     Args:
         dataset_name (str): Dataset name.
         model: Loaded model.
         tokenizer: Corresponding tokenizer.
         model_id (str): Model identifier.
-        test_size (int): Test set size.
         output_dir (Path, optional): Output directory for results.
+        test_tag (str): Canonical test split to evaluate on, "D1" or "D2".
 
     Returns:
         tuple[np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
@@ -127,14 +127,13 @@ def run_zs_d1(dataset_name: str, model, tokenizer, model_id: str, test_size: int
 
     model_tag = model_id.replace("/", "-").replace(".", "-")
 
-    d1_path = DATA_DIR / dataset_name / "D1_original.csv"
-    if not d1_path.exists():
-        print(f"[hf_zeroshot] Not found: {d1_path}")
+    test_path = DATA_DIR / dataset_name / f"{test_tag}_test.csv"
+    if not test_path.exists():
+        print(f"[hf_zeroshot] Not found: {test_path}")
         return None, None, None, None
 
-    df = pd.read_csv(d1_path)
-    _, df_test = train_test_split(df, test_size=test_size, random_state=SEED, stratify=df[target_col])
-    print(f"[hf_zeroshot] ZS_D1 test set: {len(df_test)} instances")
+    df_test = pd.read_csv(test_path)
+    print(f"[hf_zeroshot] ZS_D1 test={test_tag}: {len(df_test)} instances")
 
     X_test = df_test[[c for c in df_test.columns if c != target_col]]
     y_test = df_test[target_col].values
@@ -162,8 +161,10 @@ def run_zs_d1(dataset_name: str, model, tokenizer, model_id: str, test_size: int
     if output_dir:
         results_out = Path(output_dir)
         results_out.mkdir(parents=True, exist_ok=True)
-        prefix = f"{dataset_name}_ZS_D1_LLM_ZeroShot_{model_tag}"
+        suffix = "" if test_tag == "D1" else f"_test{test_tag}"
+        prefix = f"{dataset_name}_ZS_D1_LLM_ZeroShot_{model_tag}{suffix}"
         save_results(t1, t2, results_out, prefix=prefix)
+        save_generation_stats(results_out, prefix, prompts["system"])
 
         pred_df = df_test.copy()
         pred_df["y_pred"] = y_pred
@@ -175,19 +176,20 @@ def run_zs_d1(dataset_name: str, model, tokenizer, model_id: str, test_size: int
     return y_test, y_pred, t1, t2
 
 
-def run_zs_d5( dataset_name: str, model, tokenizer, model_id: str, test_size: int = 500, output_dir: Path = None) -> tuple:
+def run_zs_d5(dataset_name: str, model, tokenizer, model_id: str, output_dir: Path = None, test_tag: str = "D1") -> tuple:
     """Zero-shot with generic column names (ZS_D5).
 
     Measures the model's prior without activating pretraining memory.
-    Uses the same column permutation as the D5 decontamination experiment.
+    Uses the same column permutation as the D5 decontamination experiment
+    and evaluates on the canonical test split named by `test_tag`.
 
     Args:
         dataset_name (str): Dataset name.
         model: Loaded model.
         tokenizer: Corresponding tokenizer.
         model_id (str): Model identifier.
-        test_size (int): Test set size.
         output_dir (Path, optional): Output directory for results.
+        test_tag (str): Canonical test split to evaluate on, "D1" or "D2".
 
     Returns:
         tuple[np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
@@ -201,15 +203,14 @@ def run_zs_d5( dataset_name: str, model, tokenizer, model_id: str, test_size: in
 
     model_tag = model_id.replace("/", "-").replace(".", "-")
 
-    d1_path = DATA_DIR / dataset_name / "D1_original.csv"
-    if not d1_path.exists():
-        print(f"[hf_zeroshot] Not found: {d1_path}")
+    test_path = DATA_DIR / dataset_name / f"{test_tag}_test.csv"
+    if not test_path.exists():
+        print(f"[hf_zeroshot] Not found: {test_path}")
         return None, None, None, None
 
-    df = pd.read_csv(d1_path)
-    _, df_test = train_test_split(df, test_size=test_size, random_state=SEED, stratify=df[target_col])
+    df_test = pd.read_csv(test_path)
 
-    col_map        = build_column_mapping(df, target_col, seed=SEED)
+    col_map        = build_column_mapping(df_test, target_col, seed=SEED)
     anon_target    = col_map[target_col]
     df_test_anon   = df_test.rename(columns=col_map)
 
@@ -250,8 +251,10 @@ def run_zs_d5( dataset_name: str, model, tokenizer, model_id: str, test_size: in
     if output_dir:
         results_out = Path(output_dir)
         results_out.mkdir(parents=True, exist_ok=True)
-        prefix = f"{dataset_name}_ZS_D5_LLM_ZeroShot_{model_tag}"
+        suffix = "" if test_tag == "D1" else f"_test{test_tag}"
+        prefix = f"{dataset_name}_ZS_D5_LLM_ZeroShot_{model_tag}{suffix}"
         save_results(t1, t2, results_out, prefix=prefix)
+        save_generation_stats(results_out, prefix, ZS_D5_SYSTEM_PROMPTS[dataset_name])
 
         pred_df = df_test.copy()
         pred_df["y_pred"] = y_pred

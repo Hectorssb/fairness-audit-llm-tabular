@@ -83,12 +83,11 @@
     "conclusion_template": "Step {n} — Conclusion: based on education, occupation, hours, and capital activity above, the answer is {label}."
   },
   "compas": {
-    "features_to_mention": ["priors_count", "c_charge_degree", "score_text", "age"],
+    "features_to_mention": ["priors_count", "c_charge_degree", "age"],
     "step_format": "Step {n} — {topic}: {clause}.",
     "topic_labels": {
       "priors_count": "Prior record",
       "c_charge_degree": "Charge severity",
-      "score_text": "ProPublica risk score",
       "age": "Age"
     },
     "rules": {
@@ -110,15 +109,6 @@
         ],
         "default_clause": "charge degree not reported"
       },
-      "score_text": {
-        "type": "numeric_range",
-        "ranges": [
-          {"max_inclusive": 0, "clause": "ProPublica risk score is reported as Low"},
-          {"min_inclusive": 1, "max_inclusive": 1, "clause": "ProPublica risk score is reported as Medium"},
-          {"min_inclusive": 2, "clause": "ProPublica risk score is reported as High"}
-        ],
-        "default_clause": "ProPublica risk score not reported"
-      },
       "age": {
         "type": "numeric_range",
         "ranges": [
@@ -130,7 +120,7 @@
         "default_clause": "age not reported"
       }
     },
-    "conclusion_template": "Step {n} — Conclusion: based on prior record, charge severity, ProPublica risk score, and age, the answer is {label}."
+    "conclusion_template": "Step {n} — Conclusion: based on prior record, charge severity, and age, the answer is {label}."
   },
   "german": {
     "features_to_mention": ["duration", "credit_amount", "installment_rate", "credit_history", "savings", "employment"],

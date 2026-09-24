@@ -1,6 +1,7 @@
 """
-Computes performance and fairness metrics identical to those in
-González-Sendino et al. (2024) — Tables 1 and 2 of the base paper.
+Computes performance and fairness metrics identical to those of the FLAI
+library (González-Sendino et al., 2024), so that results scored here are
+comparable with the ones that library reports.
 
 Performance metrics:
   A   — Accuracy
@@ -18,8 +19,16 @@ Fairness metrics:
 
 import numpy as np
 import pandas as pd
-from typing import Union
 from pathlib import Path
+
+
+# A group predicted the same label almost always carries no information for a
+# ratio between groups, at either extreme.
+SUPPORT_MARGIN = 0.01
+
+# Width of the band around a saturated false-positive rate. Held at the value
+# the shipped results were scored with, so counts stay comparable across runs.
+COLLAPSE_FPR_MARGIN = 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -29,12 +38,17 @@ from pathlib import Path
 def group_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     """Compute performance metrics for a subgroup.
 
+    Rates with an empty denominator (e.g. TPR in a group with no positive
+    instances) are returned as NaN rather than coerced to zero, so that
+    downstream aggregation can flag insufficient support instead of
+    silently treating an unmeasured rate as a measured one.
+
     Args:
         y_true (np.ndarray): Ground-truth labels (0/1).
         y_pred (np.ndarray): Model predictions (0/1).
 
     Returns:
-        dict: Dictionary with keys A, TPR, FPR, FNR, PPP.
+        dict: Dictionary with keys A, TPR, FPR, FNR, PPP, N.
     """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
@@ -45,14 +59,15 @@ def group_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     false_positives = np.sum((y_pred == 1) & (y_true == 0))
     false_negatives = np.sum((y_pred == 0) & (y_true == 1))
 
-    accuracy = (true_positives + true_negatives) / total_samples if total_samples > 0 else 0.0
-    true_positive_rate = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0   # Recall / Sensitivity
-    false_positive_rate = false_positives / (false_positives + true_negatives) if (false_positives + true_negatives) > 0 else 0.0
-    false_negative_rate = false_negatives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
-    predicted_positive_proportion = (true_positives + false_positives) / total_samples  if total_samples > 0 else 0.0            # Predicted Positive Proportion
+    accuracy = (true_positives + true_negatives) / total_samples if total_samples > 0 else float("nan")
+    true_positive_rate = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else float("nan")   # Recall / Sensitivity
+    false_positive_rate = false_positives / (false_positives + true_negatives) if (false_positives + true_negatives) > 0 else float("nan")
+    false_negative_rate = false_negatives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else float("nan")
+    predicted_positive_proportion = (true_positives + false_positives) / total_samples  if total_samples > 0 else float("nan")            # Predicted Positive Proportion
 
     return {"A": round(accuracy, 4), "TPR": round(true_positive_rate, 4),
-            "FPR": round(false_positive_rate, 4), "FNR": round(false_negative_rate, 4), "PPP": round(predicted_positive_proportion, 4)}
+            "FPR": round(false_positive_rate, 4), "FNR": round(false_negative_rate, 4), "PPP": round(predicted_positive_proportion, 4),
+            "N": int(total_samples)}
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +111,9 @@ def disparate_impact(y_true: np.ndarray, y_pred: np.ndarray, sensitive: np.ndarr
         privileged_value (int): Value of the privileged group.
 
     Returns:
-        float: DI rounded to 4 decimal places, or inf if PPP_privileged == 0.
+        float: DI rounded to 4 decimal places. NaN if either proportion is
+            unmeasured or both are zero (0/0); inf if only PPP_privileged
+            is zero (maximal measured disparity).
     """
     is_privileged   = sensitive == privileged_value
     is_unprivileged = sensitive != privileged_value
@@ -104,9 +121,55 @@ def disparate_impact(y_true: np.ndarray, y_pred: np.ndarray, sensitive: np.ndarr
     ppp_priv   = group_metrics(y_true[is_privileged],   y_pred[is_privileged])["PPP"]
     ppp_unpriv = group_metrics(y_true[is_unprivileged], y_pred[is_unprivileged])["PPP"]
 
+    if np.isnan(ppp_priv) or np.isnan(ppp_unpriv):
+        return float("nan")
     if ppp_priv == 0:
-        return float("inf")
+        return float("nan") if ppp_unpriv == 0 else float("inf")
     return round(ppp_unpriv / ppp_priv, 4)
+
+
+def disparate_impact_interval(y_true: np.ndarray, y_pred: np.ndarray,
+                              sensitive: np.ndarray, privileged_value: int,
+                              confidence: float = 0.95) -> tuple:
+    """Confidence interval for DI by the Katz log-ratio method.
+
+    DI is a ratio of proportions, so a small protected group makes it swing
+    wildly: one positive prediction out of two cases reports the same DI as
+    fifty out of a hundred, on evidence that does not support it. The interval
+    is computed on the log scale, where the ratio is approximately normal, and
+    exponentiated back.
+
+    Args:
+        y_true (np.ndarray): Ground-truth labels.
+        y_pred (np.ndarray): Predictions.
+        sensitive (np.ndarray): Protected attribute values.
+        privileged_value (int): Value of the privileged group.
+        confidence (float): Coverage of the interval.
+
+    Returns:
+        tuple: (low, high), both NaN when either group has no positive
+            prediction, since the log ratio is undefined there.
+    """
+    from scipy.stats import norm
+
+    is_privileged   = sensitive == privileged_value
+    is_unprivileged = sensitive != privileged_value
+
+    pos_priv   = int(np.sum(y_pred[is_privileged] == 1))
+    pos_unpriv = int(np.sum(y_pred[is_unprivileged] == 1))
+    n_priv     = int(np.sum(is_privileged))
+    n_unpriv   = int(np.sum(is_unprivileged))
+
+    if min(pos_priv, pos_unpriv, n_priv, n_unpriv) == 0:
+        return float("nan"), float("nan")
+
+    log_ratio = np.log((pos_unpriv / n_unpriv) / (pos_priv / n_priv))
+    # Katz standard error of the log ratio.
+    se = np.sqrt(1 / pos_unpriv - 1 / n_unpriv + 1 / pos_priv - 1 / n_priv)
+    z = norm.ppf(1 - (1 - confidence) / 2)
+
+    return (round(float(np.exp(log_ratio - z * se)), 4),
+            round(float(np.exp(log_ratio + z * se)), 4))
 
 
 def statistical_parity_difference(y_true: np.ndarray, y_pred: np.ndarray, sensitive: np.ndarray, privileged_value: int) -> float:
@@ -164,6 +227,29 @@ def odds_difference(y_true: np.ndarray, y_pred: np.ndarray, sensitive: np.ndarra
 # FULL EVALUATION
 # ---------------------------------------------------------------------------
 
+def _group_is_degenerate(rates: dict) -> bool:
+    """Whether a group's predictions carry no decision to compare against.
+
+    Two independent signs, since each misses cases the other catches: the
+    predicted-positive rate sitting at either extreme, or a group whose true
+    positives all pass while nearly every negative does too (and the mirror
+    case, where none of either does).
+
+    Args:
+        rates (dict): One group's metrics as returned by group_metrics.
+
+    Returns:
+        bool: True when the group leaves nothing to measure.
+    """
+    ppp, tpr, fpr = rates["PPP"], rates["TPR"], rates["FPR"]
+
+    if not pd.isna(ppp) and (ppp <= SUPPORT_MARGIN or ppp >= 1 - SUPPORT_MARGIN):
+        return True
+    if pd.isna(tpr) or pd.isna(fpr):
+        return False
+    return (tpr == 1.0 and fpr >= 1 - COLLAPSE_FPR_MARGIN) or \
+           (tpr == 0.0 and fpr <= COLLAPSE_FPR_MARGIN)
+
 def evaluate(y_true: np.ndarray, y_pred: np.ndarray, sensitive: np.ndarray, privileged_value: int, sensitive_name: str = "feature", model_name: str = "Model", dataset_name: str = "Dataset") -> tuple:
     """Evaluate performance and fairness, returning two DataFrames.
 
@@ -181,8 +267,8 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, sensitive: np.ndarray, priv
 
     Returns:
         tuple[pd.DataFrame, pd.DataFrame]:
-            - table_performance: per-group performance (Algorithm, Dataset, Feature, Group, A, TPR, FPR, FNR, PPP).
-            - table_fairness: global fairness metrics (Algorithm, Dataset, Feature, EOD, DI, SPD, OD).
+            - table_performance: per-group performance (Algorithm, Dataset, Feature, Group, A, TPR, FPR, FNR, PPP, N).
+            - table_fairness: global fairness metrics (Algorithm, Dataset, Feature, EOD, DI, SPD, OD, insufficient_support).
     """
     is_privileged   = sensitive == privileged_value
     is_unprivileged = sensitive != privileged_value
@@ -194,6 +280,17 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, sensitive: np.ndarray, priv
     di  = disparate_impact(y_true, y_pred, sensitive, privileged_value)
     spd = statistical_parity_difference(y_true, y_pred, sensitive, privileged_value)
     od  = odds_difference(y_true, y_pred, sensitive, privileged_value)
+
+    di_low, di_high = disparate_impact_interval(
+        y_true, y_pred, sensitive, privileged_value)
+
+    degenerate_ratio = any(
+        _group_is_degenerate(rates)
+        for rates in (privileged_group_metrics, underprivileged_group_metrics)
+    )
+    insufficient_support = (any(pd.isna(v) for v in (eod, di, spd, od))
+                            or np.isinf(di)
+                            or degenerate_ratio)
 
     # Table 1 — per-group performance
     performance_rows = [
@@ -214,7 +311,9 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, sensitive: np.ndarray, priv
     fairness_table = pd.DataFrame([{
         "Algorithm": model_name, "Dataset": dataset_name,
         "Feature": sensitive_name,
-        "EOD": eod, "DI": di, "SPD": spd, "OD": od
+        "EOD": eod, "DI": di, "SPD": spd, "OD": od,
+        "DI_low": di_low, "DI_high": di_high,
+        "insufficient_support": insufficient_support
     }])
 
     return performance_table, fairness_table
@@ -301,8 +400,7 @@ def save_results(table_performance: pd.DataFrame, table_fairness: pd.DataFrame, 
 def consolidate_results(results_dir) -> tuple:
     """Read all results CSVs and consolidate them into two DataFrames.
 
-    Useful for generating the final paper tables with all models
-    and conditions in a single DataFrame.
+    Useful for collecting every model and condition into a single DataFrame.
 
     Args:
         results_dir (str or Path): Root results directory.

@@ -4,8 +4,8 @@ Given a row sampled from a dataset's training split and the corresponding
 binary label, this module produces a chain-of-thought reasoning string by
 applying the rules declared in `prompts/d4b_reasoning_template.json`.
 
-Properties (audited in test_reasoning_generator.py):
-1. Never references protected attributes (sex, race, age in German Credit).
+Properties:
+1. Never references protected attributes.
 2. Fully deterministic: same row + same template + same label always produce
    the same string. No RNG, no auxiliary LLM call.
 3. Missing or unrecognised feature values fall back to neutral default clauses
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import math
 import pandas as pd
-from typing import Any
 
 from prompts import D4B_REASONING_TEMPLATE
 
@@ -145,8 +144,7 @@ def _composite_matches(cond: dict, row: pd.Series) -> bool:
     for key, threshold in cond.items():
         if key == "clause":
             continue
-        # key is like "capital_gain_min_exclusive", "capital_loss_max_inclusive"
-        # Parse: <feature>_<bound_kind>
+
         parts = key.rsplit("_", 2)
         if len(parts) != 3:
             return False
@@ -194,7 +192,7 @@ def _fmt_numeric(v: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PROTECTED-ATTRIBUTE AUDIT (used by tests)
+# PROTECTED-ATTRIBUTE AUDIT (exercised by tests/test_reasoning_template.py)
 # ---------------------------------------------------------------------------
 
 # Columns the reasoning is NEVER allowed to reference textually for each

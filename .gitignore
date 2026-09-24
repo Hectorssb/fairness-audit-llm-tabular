@@ -35,6 +35,8 @@ data/*/D3_resampled.csv
 # Experiment outputs are shipped as results.zip (unzip to results/ before analysis).
 # The unzipped directory and intermediate caches are not tracked.
 results/
+analysis/*
+!analysis/cells.py
 analysis/.ipynb_checkpoints/
 
 # Logs — ignore .log files but keep the directory placeholder
