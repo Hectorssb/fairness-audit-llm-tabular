@@ -35,6 +35,9 @@ data/*/D3_resampled.csv
 # Experiment outputs are shipped as results.zip (unzip to results/ before analysis).
 # The unzipped directory and intermediate caches are not tracked.
 results/
+results_seed*/
+results_summary/
+results_checks/
 analysis/*
 !analysis/cells.py
 analysis/.ipynb_checkpoints/
@@ -42,11 +45,15 @@ analysis/.ipynb_checkpoints/
 # Logs — ignore .log files but keep the directory placeholder
 logs/*.log
 
-# Compressed archives (results.zip is tracked as the experiment output bundle)
+# Compressed archives (the results archives are tracked as the experiment output bundles)
 *.tar.gz
 *.zip
 *.gz
 !results.zip
+!results_seed1.zip
+!results_seed8.zip
+!results_summary.zip
+!results_checks.zip
 
 # Local HuggingFace model downloads
 models/

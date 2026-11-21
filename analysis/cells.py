@@ -24,6 +24,8 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "results"
+REFERENCE_SEED = 42
+DRAWS = {"A": 42, "B": 1, "C": 8}
 
 MODEL_LABEL = {
     "meta-llama-Llama-3-1-8B-Instruct": "Llama-3.1-8B",
@@ -54,6 +56,11 @@ COND_LABEL = {"D1_original": "D1", "D2_fair_causal": "D2", "D3_resampled": "D3",
 # Conditions reported on both canonical test splits.
 DUAL_TEST = ["D4a", "D4b_D1", "D4b_D2", "D4r_0", "D4r_D1", "D4r_D2", "D6_fairprompt", "D5_decontam",
              "D1_original", "D2_fair_causal", "D3_resampled", "ZS_D1", "ZS_D5"]
+DEMO_CONDITIONS = ["D1_original", "D2_fair_causal", "D3_resampled", "D4b_D1", "D4b_D2",
+                   "D4r_D1", "D4r_D2", "D6_fairprompt", "D5_decontam"]
+# The resampling stream is drawn group by group, so the intervals depend on this order.
+RESAMPLE_ORDER = [("compas", "D2"), ("compas", "D1"), ("german", "D2"), ("german", "D1"),
+                  ("adult", "D2"), ("adult", "D1")]
 
 EOD_BAND = 0.1
 DI_BAND = (0.8, 1.2)
@@ -71,13 +78,22 @@ def _condition_of(algorithm: str) -> str:
     return match.group(1) if match else str(algorithm)
 
 
-def _pass_frames(kind: str) -> pd.DataFrame:
+def _draw_file(path: str, seed: int) -> str:
+    name, tag, dataset = Path(path).name, Path(path).parent.name, Path(path).parents[1].name
+    cond = re.sub(rf"^{dataset}_", "", name).split("_LLM_")[0]
+    if seed == REFERENCE_SEED or cond not in DEMO_CONDITIONS:
+        return path
+    stem, kind = re.match(r"(.*)_(table_fairness|table_performance|predictions)\.csv$", name).groups()
+    return str(RESULTS.parent / f"results_seed{seed}" / dataset / tag / f"{stem}_seed{seed}_{kind}.csv")
+
+
+def _pass_frames(kind: str, seed: int = REFERENCE_SEED) -> pd.DataFrame:
     frames = []
     for path in glob.glob(str(RESULTS / "*" / "*" / f"*_table_{kind}.csv")):
         tag = Path(path).parent.name
         if tag not in MODEL_LABEL:
             continue
-        frame = pd.read_csv(path)
+        frame = pd.read_csv(_draw_file(path, seed))
         frame["model"] = MODEL_LABEL[tag]
         frame["tag"] = tag
         frame["dataset"] = Path(path).parents[1].name
@@ -101,14 +117,14 @@ def _require_current_schema(fair: pd.DataFrame, perf: pd.DataFrame) -> None:
             "Unzip the results.zip shipped with this release, or re-run main.py.")
 
 
-def load_cells() -> pd.DataFrame:
+def load_cells(seed: int = REFERENCE_SEED) -> pd.DataFrame:
     """One row per cell with metrics, group rates, collapse flag and accuracy.
 
     Returns:
         pd.DataFrame indexed by (cond, model, dataset, feature, test).
     """
-    fair = _pass_frames("fairness")
-    perf = _pass_frames("performance")
+    fair = _pass_frames("fairness", seed)
+    perf = _pass_frames("performance", seed)
     _require_current_schema(fair, perf)
     key = ["cond", "model", "dataset", "Feature", "test"]
 
@@ -130,8 +146,8 @@ def load_cells() -> pd.DataFrame:
     return cells.set_index(["cond", "model", "dataset", "feature", "test"]).sort_index()
 
 
-def load_predictions(conds=None) -> dict:
-    """Prediction arrays for resampling, grouped by (dataset, test).
+def load_predictions(conds=None, seed: int = REFERENCE_SEED) -> dict:
+    """Prediction arrays for resampling, grouped by (dataset, test) in RESAMPLE_ORDER.
 
     Returns:
         dict: (dataset, test) -> {"y_true", "sensitive": {feature: array},
@@ -148,7 +164,7 @@ def load_predictions(conds=None) -> dict:
         if conds is not None and cond not in conds:
             continue
         test = _test_of(name)
-        frame = pd.read_csv(path).sort_values("instance_idx")
+        frame = pd.read_csv(_draw_file(path, seed)).sort_values("instance_idx")
         group = groups.setdefault((dataset, test), {"y_true": None, "sensitive": {}, "privileged": {}, "preds": {}})
         y_true = frame["y_true"].to_numpy()
         if group["y_true"] is None:
@@ -159,16 +175,12 @@ def load_predictions(conds=None) -> dict:
         else:
             assert np.array_equal(group["y_true"], y_true), f"{path}: y_true differs within {dataset}/{test}"
         group["preds"][(cond, MODEL_LABEL[tag])] = frame["y_pred"].to_numpy()
-    return groups
+    order = [key for key in RESAMPLE_ORDER if key in groups] + sorted(set(groups) - set(RESAMPLE_ORDER))
+    return {key: groups[key] for key in order}
 
 
 def genuine_matrix(y_true, sensitive, privileged, preds, idx=None, fpr_margin=COLLAPSE_FPR_MARGIN, support_margin=SUPPORT_MARGIN) -> tuple:
     """Gates of every prediction vector at once, optionally on a resample.
-
-    Mirrors metrics.py: rates rounded to four decimals, EOD unmeasured when a
-    group has no positive instance, DI unmeasured or infinite when the
-    privileged group has no positive prediction, and a group degenerate when
-    its predicted-positive rate sits at either extreme or its rates saturate.
 
     Args:
         y_true: Labels of the test set.
@@ -236,6 +248,23 @@ def load_baselines() -> pd.DataFrame:
     frame["di_ok"] = np.isfinite(frame["DI"]) & (frame["DI"] >= DI_BAND[0]) & (frame["DI"] <= DI_BAND[1])
     frame["gf"] = frame["eod_ok"] & frame["di_ok"] & ~frame["collapsed"]
     return frame
+
+
+def median_di(values: pd.DataFrame) -> pd.Series:
+    """Disparate impact of every cell across demonstration draws.
+
+    The median of the finite ratios when at least two draws are finite,
+    infinite when at least two draws are infinite, and undefined otherwise.
+
+    Args:
+        values: One row per cell and one column per draw.
+
+    Returns:
+        pd.Series aligned with the rows of `values`.
+    """
+    finite = values.where(np.isfinite(values))
+    result = finite.median(axis=1).where(finite.count(axis=1) >= 2)
+    return result.mask(np.isposinf(values).sum(axis=1) >= 2, np.inf)
 
 
 def pct(n: int, d: int) -> int:
